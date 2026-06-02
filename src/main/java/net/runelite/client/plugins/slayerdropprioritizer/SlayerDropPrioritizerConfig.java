@@ -20,7 +20,7 @@ public interface SlayerDropPrioritizerConfig extends Config {
     }
 
     @Range(min = 0, max = 2147483647)
-    @ConfigItem(keyName = "minimumPriorityValue", name = "Minimum Priority Value", description = "Minimum GE value required for prioritization", position = 3)
+    @ConfigItem(keyName = "minimumPriorityValue", name = "Minimum Priority Value", description = "Minimum GE value to prioritize any item (task drops + non-task valuable items)", position = 3)
     default int minimumPriorityValue() {
         return 0;
     }
