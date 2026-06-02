@@ -342,162 +342,220 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
     @Subscribe
     public void onMenuOpened(MenuOpened event) {
-        log.info(
-                "[Menu] Opened | drops={} | combatTicksAgo={}",
-                currentTaskDrops.size(),
-                client.getTickCount() - lastCombatTick);
-
         if (!config.enableDeprioritization()) {
+            log.debug("[Menu] Plugin disabled");
             return;
         }
 
         if (currentTaskDrops.isEmpty()) {
+            log.debug("[Menu] No drops loaded yet");
             return;
         }
 
         if ((client.getTickCount() - lastCombatTick) > config.combatTimeout()) {
+            log.debug("[Menu] Outside combat grace period");
             return;
         }
 
         MenuEntry[] entries = client.getMenuEntries();
+        List<ClassifiedMenuItem> groundItems = extractAndClassifyGroundItems(entries);
 
-        List<MenuEntry> grounds = new ArrayList<>();
-        List<Integer> indices = new ArrayList<>();
-
-        for (int i = 0; i < entries.length; i++) {
-            MenuAction action = entries[i].getType();
-
-            if (action == MenuAction.GROUND_ITEM_FIRST_OPTION
-                    || action == MenuAction.GROUND_ITEM_SECOND_OPTION
-                    || action == MenuAction.GROUND_ITEM_THIRD_OPTION
-                    || action == MenuAction.GROUND_ITEM_FOURTH_OPTION
-                    || action == MenuAction.GROUND_ITEM_FIFTH_OPTION
-                    || action == MenuAction.EXAMINE_ITEM_GROUND) {
-                grounds.add(entries[i]);
-                indices.add(i);
-
-                log.info(
-                        "[Menu] Ground item: {} | option={} | identifier={}",
-                        entries[i].getTarget(),
-                        entries[i].getOption(),
-                        entries[i].getIdentifier());
-            }
-        }
-        if (grounds.isEmpty()) {
+        if (groundItems.isEmpty()) {
+            log.debug("[Menu] No ground items in menu");
             return;
         }
+
+        log.info("[Menu] Opened with {} ground items (drops={}, combatTicksAgo={})",
+                groundItems.size(),
+                currentTaskDrops.size(),
+                client.getTickCount() - lastCombatTick);
 
         if (config.dropDisplayMode() == DropDisplayMode.SHOW) {
+            log.debug("[Menu] SHOW mode - no changes");
             return;
-        }
-
-        List<MenuEntry> priorityTake = new ArrayList<>();
-        List<MenuEntry> priorityExamine = new ArrayList<>();
-        List<MenuEntry> nonPriorityTake = new ArrayList<>();
-        List<MenuEntry> nonPriorityExamine = new ArrayList<>();
-
-        for (MenuEntry entry : grounds) {
-            String itemName = normalizeItemName(entry.getTarget());
-            boolean priority = currentTaskDrops.contains(itemName);
-
-            if (priority
-                    && config.prioritizationMode() == PrioritizationMode.VALUABLE_TASK_DROPS) {
-                int gePrice = itemManager.getItemPrice(entry.getIdentifier());
-
-                priority = gePrice >= config.minimumPriorityValue();
-
-                log.info(
-                        "[Value Filter] {} | id={} | price={} | priority={}",
-                        itemName,
-                        entry.getIdentifier(),
-                        gePrice,
-                        priority);
-            }
-
-            log.info(
-                    "[Menu] {} | option={} | priority={}",
-                    itemName,
-                    entry.getOption(),
-                    priority);
-
-            String option = normalizeItemName(entry.getOption()).trim();
-
-            if (priority) {
-                if ("Take".equalsIgnoreCase(option)) {
-                    priorityTake.add(entry);
-                } else if ("Examine".equalsIgnoreCase(option)) {
-                    priorityExamine.add(entry);
-                }
-            } else {
-                if ("Take".equalsIgnoreCase(option)) {
-                    nonPriorityTake.add(entry);
-                } else if ("Examine".equalsIgnoreCase(option)) {
-                    nonPriorityExamine.add(entry);
-                }
-            }
         }
 
         if (config.dropDisplayMode() == DropDisplayMode.HIDE) {
-            // For HIDE mode: only keep priority items
-            List<MenuEntry> finalMenu = new ArrayList<>();
-
-            // Keep all non-ground items
-            for (int i = 0; i < entries.length; i++) {
-                if (!indices.contains(i)) {
-                    finalMenu.add(entries[i]);
-                }
-            }
-
-            // Add priority Take entries first
-            finalMenu.addAll(priorityTake);
-
-            // Add priority Examine if "Prioritize Examine" is enabled
-            if (config.prioritizeExamine()) {
-                finalMenu.addAll(priorityExamine);
-            }
-
-            log.info("========== HIDE MODE FINAL ==========");
-            for (MenuEntry entry : finalMenu) {
-                String option = normalizeItemName(entry.getOption()).trim();
-                String target = normalizeItemName(entry.getTarget()).trim();
-                boolean isGround = indices.contains(entries[0]); // simplified check
-                log.info("[FINAL] option={} target={}", option, target);
-            }
-
-            client.setMenuEntries(finalMenu.toArray(new MenuEntry[0]));
+            processHideMode(entries, groundItems);
         } else if (config.dropDisplayMode() == DropDisplayMode.DEPRIORITIZE) {
-            // For DEPRIORITIZE mode: reorder all items with priority at top
-            List<MenuEntry> reordered = new ArrayList<>();
+            processDeprioritizeMode(entries, groundItems);
+        }
+    }
 
-            // Add priority Take entries first
-            reordered.addAll(priorityTake);
+    /**
+     * Extracts and classifies all ground items from the menu.
+     */
+    private List<ClassifiedMenuItem> extractAndClassifyGroundItems(MenuEntry[] entries) {
+        List<ClassifiedMenuItem> groundItems = new ArrayList<>();
 
-            // Add priority Examine if "Prioritize Examine" is enabled
-            if (config.prioritizeExamine()) {
-                reordered.addAll(priorityExamine);
+        for (int i = 0; i < entries.length; i++) {
+            MenuEntry entry = entries[i];
+            MenuAction action = entry.getType();
+
+            if (!isGroundItemAction(action)) {
+                continue;
             }
 
-            // Add non-priority items (both Take and Examine)
-            reordered.addAll(nonPriorityTake);
-            reordered.addAll(nonPriorityExamine);
+            String normalizedItemName = normalizeItemName(entry.getTarget());
+            String normalizedOption = normalizeItemName(entry.getOption()).trim();
+            int itemId = entry.getIdentifier();
+            boolean isPriority = isPriorityItem(normalizedItemName, itemId);
 
-            log.info("========== DEPRIORITIZE MODE FINAL ==========");
-            for (MenuEntry entry : reordered) {
-                String option = normalizeItemName(entry.getOption()).trim();
-                String target = normalizeItemName(entry.getTarget()).trim();
-                log.info("[FINAL] option={} target={}", option, target);
-            }
+            ClassifiedMenuItem item = new ClassifiedMenuItem(
+                    entry,
+                    i,
+                    normalizedItemName,
+                    normalizedOption,
+                    isPriority,
+                    itemId);
 
-            // Replace the ground items in their original positions
-            int limit = Math.min(indices.size(), reordered.size());
-            for (int i = 0; i < limit; i++) {
-                entries[indices.get(i)] = reordered.get(i);
-            }
+            groundItems.add(item);
 
-            client.setMenuEntries(entries);
+            log.debug("[Classify] {} ({}) | option={} | priority={}",
+                    normalizedItemName,
+                    itemId,
+                    normalizedOption,
+                    isPriority);
         }
 
-        log.info("[Menu] Processed {} ground items", grounds.size());
+        return groundItems;
+    }
+
+    /**
+     * Checks if a menu action represents a ground item.
+     */
+    private boolean isGroundItemAction(MenuAction action) {
+        return action == MenuAction.GROUND_ITEM_FIRST_OPTION
+                || action == MenuAction.GROUND_ITEM_SECOND_OPTION
+                || action == MenuAction.GROUND_ITEM_THIRD_OPTION
+                || action == MenuAction.GROUND_ITEM_FOURTH_OPTION
+                || action == MenuAction.GROUND_ITEM_FIFTH_OPTION
+                || action == MenuAction.EXAMINE_ITEM_GROUND;
+    }
+
+    /**
+     * Determines if an item should be prioritized.
+     * Supports both task drops and valuable items.
+     */
+    private boolean isPriorityItem(String normalizedItemName, int itemId) {
+        // Task drops are always considered unless filtered by price
+        if (currentTaskDrops.contains(normalizedItemName)) {
+            if (config.prioritizationMode() == PrioritizationMode.VALUABLE_TASK_DROPS) {
+                int gePrice = itemManager.getItemPrice(itemId);
+                boolean valuable = gePrice >= config.minimumPriorityValue();
+                log.debug("[Value Check] {} id={} price={} valuable={}",
+                        normalizedItemName, itemId, gePrice, valuable);
+                return valuable;
+            }
+            return true;
+        }
+
+        // Non-task items can be prioritized if valuable
+        if (config.prioritizationMode() == PrioritizationMode.VALUABLE_TASK_DROPS) {
+            int gePrice = itemManager.getItemPrice(itemId);
+            boolean valuable = gePrice >= config.minimumPriorityValue();
+            if (valuable) {
+                log.debug("[Valuable Non-Task] {} id={} price={}",
+                        normalizedItemName, itemId, gePrice);
+            }
+            return valuable;
+        }
+
+        return false;
+    }
+
+    /**
+     * HIDE mode: removes all non-priority ground items.
+     * Preserves non-ground menu entries.
+     */
+    private void processHideMode(MenuEntry[] entries, List<ClassifiedMenuItem> groundItems) {
+        List<MenuEntry> result = new ArrayList<>();
+
+        // Build a set of ground item indices for faster lookup
+        java.util.Set<Integer> groundIndices = new java.util.HashSet<>();
+        for (ClassifiedMenuItem item : groundItems) {
+            groundIndices.add(item.getOriginalIndex());
+        }
+
+        // Add all non-ground items
+        for (int i = 0; i < entries.length; i++) {
+            if (!groundIndices.contains(i)) {
+                result.add(entries[i]);
+            }
+        }
+
+        // Add only priority ground items
+        for (ClassifiedMenuItem item : groundItems) {
+            if (item.isPriority()) {
+                result.add(item.getEntry());
+                log.debug("[HIDE] Keep: {}", item.getNormalizedItemName());
+            } else {
+                log.debug("[HIDE] Remove: {}", item.getNormalizedItemName());
+            }
+        }
+
+        client.setMenuEntries(result.toArray(new MenuEntry[0]));
+        log.info("[Menu] HIDE mode applied, {} items hidden",
+                groundItems.size() - (int) groundItems.stream().filter(ClassifiedMenuItem::isPriority).count());
+    }
+
+    /**
+     * DEPRIORITIZE mode: reorders ground items, keeping priority items first.
+     * Preserves all non-ground menu entries at their original positions.
+     */
+    private void processDeprioritizeMode(MenuEntry[] entries, List<ClassifiedMenuItem> groundItems) {
+        // Separate priority and non-priority items, grouped by "Take" and "Examine"
+        List<ClassifiedMenuItem> priorityTake = new ArrayList<>();
+        List<ClassifiedMenuItem> priorityExamine = new ArrayList<>();
+        List<ClassifiedMenuItem> nonPriorityTake = new ArrayList<>();
+        List<ClassifiedMenuItem> nonPriorityExamine = new ArrayList<>();
+
+        for (ClassifiedMenuItem item : groundItems) {
+            if (item.isPriority()) {
+                if ("Take".equalsIgnoreCase(item.getNormalizedOption())) {
+                    priorityTake.add(item);
+                } else if ("Examine".equalsIgnoreCase(item.getNormalizedOption())) {
+                    priorityExamine.add(item);
+                }
+            } else {
+                if ("Take".equalsIgnoreCase(item.getNormalizedOption())) {
+                    nonPriorityTake.add(item);
+                } else if ("Examine".equalsIgnoreCase(item.getNormalizedOption())) {
+                    nonPriorityExamine.add(item);
+                }
+            }
+        }
+
+        // Build reordered list of ground items
+        List<ClassifiedMenuItem> reordered = new ArrayList<>();
+        reordered.addAll(priorityTake);
+        if (config.prioritizeExamine()) {
+            reordered.addAll(priorityExamine);
+        }
+        reordered.addAll(nonPriorityTake);
+        if (!config.prioritizeExamine()) {
+            reordered.addAll(nonPriorityExamine);
+        } else {
+            reordered.addAll(nonPriorityExamine);
+        }
+
+        // Apply reordering to original array positions
+        for (int i = 0; i < reordered.size() && i < groundItems.size(); i++) {
+            int targetIdx = groundItems.get(i).getOriginalIndex();
+            entries[targetIdx] = reordered.get(i).getEntry();
+        }
+
+        client.setMenuEntries(entries);
+        log.info("[Menu] DEPRIORITIZE mode applied: {} priority items first",
+                priorityTake.size() + (config.prioritizeExamine() ? priorityExamine.size() : 0));
+
+        // Debug logging
+        if (log.isDebugEnabled()) {
+            log.debug("[DEPRIORITIZE] Final order:");
+            for (ClassifiedMenuItem item : reordered) {
+                log.debug("  - {} ({})", item.getNormalizedItemName(), item.isPriority() ? "PRIORITY" : "NON-PRIORITY");
+            }
+        }
     }
 
     public String getCurrentTask() {
