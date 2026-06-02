@@ -1,12 +1,15 @@
 package net.runelite.client.plugins.slayerdropprioritizer;
 
 import com.google.gson.Gson;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.*;
+import net.runelite.api.Actor;
+import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
+import net.runelite.api.NPC;
+import net.runelite.api.Player;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuOpened;
 import net.runelite.client.config.ConfigManager;
@@ -14,22 +17,29 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
-import okhttp3.*;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.game.ItemManager;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
 import javax.inject.Inject;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.HashMap;
+import java.util.Map;
 
 @Slf4j
-@PluginDescriptor(
-    name = "Slayer Drop Prioritizer",
-    description = "Deprioriza itens fora da drop table do monstro da task atual.",
-    tags = {"slayer", "drops", "menu", "wiki", "combat"}
-)
-public class SlayerDropPrioritizerPlugin extends Plugin
-{
+@PluginDescriptor(name = "Slayer Drop Prioritizer", description = "Deprioritizes items outside task drop table.", tags = {
+        "slayer", "drops", "menu" })
+public class SlayerDropPrioritizerPlugin extends Plugin {
     @Inject
     private Client client;
 
@@ -45,210 +55,474 @@ public class SlayerDropPrioritizerPlugin extends Plugin
     @Inject
     private Gson gson;
 
+    @Inject
+    private ItemManager itemManager;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private SlayerDropPrioritizerOverlay overlay;
+
     private String currentTask = "";
-    private final Set<Integer> currentTaskDrops = new HashSet<>();
-    private boolean inCombatWithTask = false;
+    private final Set<String> currentTaskDrops = new HashSet<>();
+    private final Set<Integer> resolvedNpcIds = new HashSet<>();
+
+    private String normalizeItemName(String itemName) {
+        itemName = net.runelite.client.util.Text.removeTags(itemName);
+
+        if (config.supportCollapsedItems()) {
+            itemName = itemName.replaceAll("\\s+x\\s+\\d+$", "");
+        }
+
+        itemName = itemName
+                .replaceAll("\\s*\\([^)]*\\)$", "")
+                .trim();
+
+        return itemName;
+    }
+
+    private int lastCombatTick = -100;
+
+    private static final int DEFAULT_COMBAT_TIMEOUT = 50;
+
+    private String currentNpc = "";
+    private int currentNpcId = -1;
+    private String lastWikiPage = "";
 
     @Provides
-    SlayerDropPrioritizerConfig provideConfig(ConfigManager configManager)
-    {
+    SlayerDropPrioritizerConfig provideConfig(ConfigManager configManager) {
         return configManager.getConfig(SlayerDropPrioritizerConfig.class);
     }
 
     @Override
-    protected void startUp() throws Exception
-    {
-        log.info("Slayer Drop Prioritizer iniciado!");
-        
-        // Assim que o plugin liga, ele já lê a task salva pelo plugin oficial de Slayer
-        String savedTask = configManager.getConfiguration("slayer", "taskName");
-        updateTask(savedTask);
+    protected void startUp() {
+        log.info("[Status] Plugin Started");
+
+        overlayManager.add(overlay);
+
+        checkTask();
     }
 
     @Override
-    protected void shutDown() throws Exception
-    {
-        currentTask = "";
+    protected void shutDown() {
+        overlayManager.remove(overlay);
+
         currentTaskDrops.clear();
-        inCombatWithTask = false;
-        log.info("Slayer Drop Prioritizer desligado!");
+        resolvedNpcIds.clear();
+
+        currentNpc = "";
+        currentNpcId = -1;
+        lastWikiPage = "";
     }
 
-    // Monitora as mudanças nas configurações do RuneLite em tempo real
-    @Subscribe
-    public void onConfigChanged(ConfigChanged event)
-    {
-        // Se o plugin oficial de Slayer mudar o nome da task (nova task, ou task finalizada/cancelada)
-        if ("slayer".equals(event.getGroup()) && "taskName".equals(event.getKey()))
-        {
-            updateTask(event.getNewValue());
-        }
+    private void checkTask() {
+        String task = config.testMode()
+                ? config.testMonsterName()
+                : configManager.getConfiguration("slayer", "taskName");
+
+        updateTask(task);
     }
 
-    private void updateTask(String taskName)
-    {
-        // Se a task foi cancelada ou acabada, o RuneLite salva como vazio ou nulo
-        if (taskName == null || taskName.isEmpty())
-        {
+    private void updateTask(String task) {
+        if (task == null || task.isEmpty()) {
             currentTask = "";
             currentTaskDrops.clear();
-            log.info("Nenhuma task de Slayer ativa. Drops limpos.");
+
+            log.info("[Task] Empty task detected");
+
             return;
         }
 
-        // Remove "s" no final para padronizar com a pesquisa na Wiki, ex: "Blue dragons" -> "Blue dragon"
-        String formattedTask = taskName;
-        if (formattedTask.toLowerCase().endsWith("s")) {
-            formattedTask = formattedTask.substring(0, formattedTask.length() - 1);
-        }
-        
-        if (!formattedTask.equalsIgnoreCase(currentTask))
-        {
-            currentTask = formattedTask;
-            log.info("Task de Slayer identificada: {}", currentTask);
-            fetchDropsFromWiki(currentTask);
+        if (!task.equalsIgnoreCase(currentTask)) {
+            currentTask = task;
+
+            currentTaskDrops.clear();
+            resolvedNpcIds.clear();
+
+            log.info("[Task] Target updated to: {}", currentTask);
         }
     }
 
-    private void fetchDropsFromWiki(String monsterName)
-    {
-        currentTaskDrops.clear();
-        
-        // Formata o nome para a URL da Wiki da OSRS (Semantic MediaWiki API)
-        String urlName = monsterName.replace(" ", "_");
-        String url = "https://oldschool.runescape.wiki/api.php?action=askargs&conditions=Dropped_by::" + urlName + "&printouts=Item_ID&format=json";
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event) {
+        if ("slayerdropprioritizer".equals(event.getGroup())) {
+            checkTask();
+        }
+    }
 
+    @Subscribe
+    public void onGameTick(GameTick event) {
+        Player player = client.getLocalPlayer();
+
+        if (player == null) {
+            log.debug("[Tick] Player is null");
+            return;
+        }
+
+        if (!config.enableDeprioritization()) {
+            log.debug("[Tick] Plugin disabled");
+            return;
+        }
+
+        if (currentTask.isEmpty()) {
+            log.debug("[Tick] Current task is empty");
+            return;
+        }
+
+        Actor interacting = player.getInteracting();
+
+        if (interacting == null) {
+            log.info("[Tick] No interaction");
+            return;
+        }
+
+        log.info(
+                "[Tick] Interacting with: {} ({})",
+                interacting.getName(),
+                interacting.getClass().getSimpleName());
+
+        NPC target = null;
+
+        if (interacting instanceof NPC) {
+            NPC npc = (NPC) interacting;
+
+            if (npc.getName() != null &&
+                    npc.getName().toLowerCase().contains(currentTask.toLowerCase())) {
+                target = npc;
+            }
+        }
+
+        if (target != null) {
+            currentNpc = target.getName();
+            currentNpcId = target.getId();
+
+            lastCombatTick = client.getTickCount();
+
+            log.info(
+                    "[Combat] Target found: {} ({})",
+                    currentNpc,
+                    currentNpcId);
+
+            if (dropCache.containsKey(target.getId())) {
+                currentTaskDrops.clear();
+                currentTaskDrops.addAll(dropCache.get(target.getId()));
+            } else if (currentTaskDrops.isEmpty() &&
+                    !resolvedNpcIds.contains(target.getId()))
+                log.info(
+                        "[Wiki] Resolving drops for {} ({})",
+                        target.getName(),
+                        target.getId());
+
+            resolvedNpcIds.add(target.getId());
+
+            resolveWikiPage(target.getId());
+        }
+    }
+
+    private void resolveWikiPage(int npcId) {
         Request request = new Request.Builder()
-            .url(url)
-            .header("User-Agent", "RuneLite Plugin - SlayerDropPrioritizer")
-            .build();
+                .url("https://oldschool.runescape.wiki/w/Special:Lookup?type=npc&id=" + npcId)
+                .build();
 
-        okHttpClient.newCall(request).enqueue(new Callback()
-        {
+        okHttpClient.newCall(request).enqueue(new Callback() {
             @Override
-            public void onFailure(Call call, IOException e)
-            {
-                log.error("Falha ao buscar drops na Wiki para: " + monsterName, e);
+            public void onFailure(Call call, IOException e) {
+                log.error("[Wiki] Lookup failed", e);
             }
 
             @Override
-            public void onResponse(Call call, Response response) throws IOException
-            {
-                if (!response.isSuccessful())
-                {
-                    log.error("Resposta HTTP inesperada da Wiki: " + response);
+            public void onResponse(Call call, Response response) throws IOException {
+                String page = response.request()
+                        .url()
+                        .toString()
+                        .split("/w/")[1]
+                        .split("\\?")[0]
+                        .split("#")[0];
+
+                lastWikiPage = page;
+
+                log.info("[Wiki] Resolved page: {}", page);
+
+                response.close();
+
+                fetchDrops(page);
+            }
+        });
+    }
+
+    private void fetchDrops(String page) {
+        Request request = new Request.Builder()
+                .url("https://oldschool.runescape.wiki/api.php?action=parse&page=" + page
+                        + "&format=json&prop=wikitext")
+                .build();
+
+        okHttpClient.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                log.error("[Wiki] Fetch failed", e);
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                if (!response.isSuccessful()) {
+                    response.close();
                     return;
                 }
 
-                try
-                {
-                    String responseBody = response.body().string();
-                    JsonObject json = gson.fromJson(responseBody, JsonObject.class);
-                    
-                    if (json.has("query") && json.getAsJsonObject("query").has("results"))
-                    {
-                        JsonObject results = json.getAsJsonObject("query").getAsJsonObject("results");
-                        
-                        for (String itemKey : results.keySet())
-                        {
-                            JsonObject itemData = results.getAsJsonObject(itemKey);
-                            JsonArray printouts = itemData.getAsJsonObject("printouts").getAsJsonArray("Item ID");
-                            
-                            for (JsonElement idElement : printouts)
-                            {
-                                currentTaskDrops.add(idElement.getAsInt());
-                            }
-                        }
-                        log.info("Drops carregados com sucesso para {}. Total de itens permitidos: {}", monsterName, currentTaskDrops.size());
-                    }
+                String wikiText = gson
+                        .fromJson(response.body().string(), JsonObject.class)
+                        .getAsJsonObject("parse")
+                        .getAsJsonObject("wikitext")
+                        .get("*")
+                        .getAsString();
+
+                Pattern p = Pattern.compile("\\{\\{DropsLine.*?\\}\\}", Pattern.DOTALL);
+                Matcher m = p.matcher(wikiText);
+
+                int count = 0;
+
+                while (m.find() && count < 5) {
+                    String sample = m.group()
+                            .replace("\r", "\\r")
+                            .replace("\n", "\\n");
+
+                    log.info("[Wiki] DropsLine {}: {}", count, sample);
+                    count++;
                 }
-                catch (Exception e)
-                {
-                    log.error("Erro ao analisar o JSON da Wiki.", e);
+
+                log.info(
+                        "[Wiki] Length: {}",
+                        wikiText.length());
+
+                log.info(
+                        "[Wiki] Contains DropsLine? {}",
+                        wikiText.contains("DropsLine"));
+
+                log.info(
+                        "[Wiki] Contains DropsTableHead? {}",
+                        wikiText.contains("DropsTableHead"));
+
+                log.info(
+                        "[Wiki] Contains itemid=? {}",
+                        wikiText.contains("itemid="));
+
+                int dropPos = wikiText.indexOf("Drops");
+
+                if (dropPos > -1) {
+                    int start = Math.max(0, dropPos - 200);
+                    int end = Math.min(wikiText.length(), dropPos + 1000);
+
+                    log.info(
+                            "[Wiki] Around Drops:\n{}",
+                            wikiText.substring(start, end));
                 }
-                finally
-                {
-                    response.close();
+
+                Matcher matcher = Pattern.compile("\\{\\{DropsLine\\|name=([^|}]+)")
+                        .matcher(wikiText);
+
+                while (matcher.find()) {
+                    String itemName = matcher.group(1).trim();
+
+                    currentTaskDrops.add(itemName);
+
+                    log.info("[Wiki] Drop Found: {}", itemName);
                 }
+                log.info(
+                        "[Wiki] Loaded {} item ids",
+                        currentTaskDrops.size());
+                dropCache.put(
+                        currentNpcId,
+                        new HashSet<>(currentTaskDrops));
+
+                response.close();
             }
         });
     }
 
     @Subscribe
-    public void onGameTick(GameTick event)
-    {
-        if (currentTask.isEmpty() || !config.enableDeprioritization())
-        {
-            inCombatWithTask = false;
+    public void onMenuOpened(MenuOpened event) {
+        log.info(
+                "[Menu] Opened | drops={} | combatTicksAgo={}",
+                currentTaskDrops.size(),
+                client.getTickCount() - lastCombatTick);
+
+        if (!config.enableDeprioritization()) {
             return;
         }
 
-        Player localPlayer = client.getLocalPlayer();
-        if (localPlayer == null) return;
-
-        Actor interacting = localPlayer.getInteracting();
-        
-        // Verifica se o jogador está em combate com um NPC
-        if (interacting instanceof NPC)
-        {
-            NPC npc = (NPC) interacting;
-            String npcName = npc.getName();
-            
-            // Verifica se o nome do NPC inclui o nome da task (isso engloba variações na Wilderness, etc)
-            if (npcName != null && npcName.toLowerCase().contains(currentTask.toLowerCase()))
-            {
-                inCombatWithTask = true;
-                return;
-            }
+        if (currentTaskDrops.isEmpty()) {
+            return;
         }
-        
-        inCombatWithTask = false;
-    }
 
-    @Subscribe
-    public void onMenuOpened(MenuOpened event)
-    {
-        if (!config.enableDeprioritization() || !inCombatWithTask || currentTaskDrops.isEmpty())
-        {
-            return; 
+        if ((client.getTickCount() - lastCombatTick) > config.combatTimeout()) {
+            return;
         }
 
         MenuEntry[] entries = client.getMenuEntries();
-        List<MenuEntry> priorityEntries = new ArrayList<>();
-        List<MenuEntry> deprioritizedEntries = new ArrayList<>();
 
-        for (MenuEntry entry : entries)
-        {
-            MenuAction action = entry.getType();
-            
-            if (action == MenuAction.GROUND_ITEM_FIRST_OPTION ||
-                action == MenuAction.GROUND_ITEM_SECOND_OPTION ||
-                action == MenuAction.GROUND_ITEM_THIRD_OPTION ||
-                action == MenuAction.GROUND_ITEM_FOURTH_OPTION ||
-                action == MenuAction.GROUND_ITEM_FIFTH_OPTION ||
-                action == MenuAction.EXAMINE_ITEM_GROUND)
-            {
-                int itemId = entry.getIdentifier();
+        List<MenuEntry> grounds = new ArrayList<>();
+        List<Integer> indices = new ArrayList<>();
 
-                if (!currentTaskDrops.contains(itemId))
-                {
-                    deprioritizedEntries.add(entry);
-                    continue;
-                }
+        for (int i = 0; i < entries.length; i++) {
+            MenuAction action = entries[i].getType();
+
+            if (action == MenuAction.GROUND_ITEM_FIRST_OPTION
+                    || action == MenuAction.GROUND_ITEM_SECOND_OPTION
+                    || action == MenuAction.GROUND_ITEM_THIRD_OPTION
+                    || action == MenuAction.GROUND_ITEM_FOURTH_OPTION
+                    || action == MenuAction.GROUND_ITEM_FIFTH_OPTION
+                    || action == MenuAction.EXAMINE_ITEM_GROUND) {
+                grounds.add(entries[i]);
+                indices.add(i);
+
+                log.info(
+                        "[Menu] Ground item: {} | option={} | identifier={}",
+                        entries[i].getTarget(),
+                        entries[i].getOption(),
+                        entries[i].getIdentifier());
             }
-            
-            priorityEntries.add(entry);
         }
-
-        if (deprioritizedEntries.isEmpty())
-        {
+        if (grounds.isEmpty()) {
             return;
         }
 
-        List<MenuEntry> finalMenu = new ArrayList<>();
-        finalMenu.addAll(deprioritizedEntries); // Itens sem prioridade ficam no topo da lista (fundo do menu in-game)
-        finalMenu.addAll(priorityEntries);      // Itens válidos ficam depois (topo do menu in-game)
+        if (config.dropDisplayMode() == DropDisplayMode.SHOW) {
+            return;
+        }
 
-        client.setMenuEntries(finalMenu.toArray(new MenuEntry[0]));
+        List<MenuEntry> priorityTake = new ArrayList<>();
+        List<MenuEntry> priorityExamine = new ArrayList<>();
+        List<MenuEntry> nonPriorityTake = new ArrayList<>();
+        List<MenuEntry> nonPriorityExamine = new ArrayList<>();
+
+        for (MenuEntry entry : grounds) {
+            String itemName = normalizeItemName(entry.getTarget());
+            boolean priority = currentTaskDrops.contains(itemName);
+
+            if (priority
+                    && config.prioritizationMode() == PrioritizationMode.VALUABLE_TASK_DROPS) {
+                int gePrice = itemManager.getItemPrice(entry.getIdentifier());
+
+                priority = gePrice >= config.minimumPriorityValue();
+
+                log.info(
+                        "[Value Filter] {} | id={} | price={} | priority={}",
+                        itemName,
+                        entry.getIdentifier(),
+                        gePrice,
+                        priority);
+            }
+
+            log.info(
+                    "[Menu] {} | option={} | priority={}",
+                    itemName,
+                    entry.getOption(),
+                    priority);
+
+            String option = normalizeItemName(entry.getOption()).trim();
+
+            if (priority) {
+                if ("Take".equalsIgnoreCase(option)) {
+                    priorityTake.add(entry);
+                } else if ("Examine".equalsIgnoreCase(option)) {
+                    priorityExamine.add(entry);
+                }
+            } else {
+                if ("Take".equalsIgnoreCase(option)) {
+                    nonPriorityTake.add(entry);
+                } else if ("Examine".equalsIgnoreCase(option)) {
+                    nonPriorityExamine.add(entry);
+                }
+            }
+        }
+
+        if (config.dropDisplayMode() == DropDisplayMode.HIDE) {
+            // For HIDE mode: only keep priority items
+            List<MenuEntry> finalMenu = new ArrayList<>();
+
+            // Keep all non-ground items
+            for (int i = 0; i < entries.length; i++) {
+                if (!indices.contains(i)) {
+                    finalMenu.add(entries[i]);
+                }
+            }
+
+            // Add priority Take entries first
+            finalMenu.addAll(priorityTake);
+
+            // Add priority Examine if "Prioritize Examine" is enabled
+            if (config.prioritizeExamine()) {
+                finalMenu.addAll(priorityExamine);
+            }
+
+            log.info("========== HIDE MODE FINAL ==========");
+            for (MenuEntry entry : finalMenu) {
+                String option = normalizeItemName(entry.getOption()).trim();
+                String target = normalizeItemName(entry.getTarget()).trim();
+                boolean isGround = indices.contains(entries[0]); // simplified check
+                log.info("[FINAL] option={} target={}", option, target);
+            }
+
+            client.setMenuEntries(finalMenu.toArray(new MenuEntry[0]));
+        } else if (config.dropDisplayMode() == DropDisplayMode.DEPRIORITIZE) {
+            // For DEPRIORITIZE mode: reorder all items with priority at top
+            List<MenuEntry> reordered = new ArrayList<>();
+
+            // Add priority Take entries first
+            reordered.addAll(priorityTake);
+
+            // Add priority Examine if "Prioritize Examine" is enabled
+            if (config.prioritizeExamine()) {
+                reordered.addAll(priorityExamine);
+            }
+
+            // Add non-priority items (both Take and Examine)
+            reordered.addAll(nonPriorityTake);
+            reordered.addAll(nonPriorityExamine);
+
+            log.info("========== DEPRIORITIZE MODE FINAL ==========");
+            for (MenuEntry entry : reordered) {
+                String option = normalizeItemName(entry.getOption()).trim();
+                String target = normalizeItemName(entry.getTarget()).trim();
+                log.info("[FINAL] option={} target={}", option, target);
+            }
+
+            // Replace the ground items in their original positions
+            int limit = Math.min(indices.size(), reordered.size());
+            for (int i = 0; i < limit; i++) {
+                entries[indices.get(i)] = reordered.get(i);
+            }
+
+            client.setMenuEntries(entries);
+        }
+
+        log.info("[Menu] Processed {} ground items", grounds.size());
     }
+
+    public String getCurrentTask() {
+        return currentTask;
+    }
+
+    public String getCurrentNpc() {
+        return currentNpc;
+    }
+
+    public int getCurrentNpcId() {
+        return currentNpcId;
+    }
+
+    public int getDropCount() {
+        return currentTaskDrops.size();
+    }
+
+    public String getLastWikiPage() {
+        return lastWikiPage;
+    }
+
+    public boolean isInCombatGrace() {
+        return (client.getTickCount() - lastCombatTick) <= config.combatTimeout();
+    }
+
+    private final Map<Integer, Set<String>> dropCache = new HashMap<>();
 }
