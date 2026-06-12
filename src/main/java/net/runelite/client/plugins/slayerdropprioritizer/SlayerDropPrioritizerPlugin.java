@@ -65,8 +65,9 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
     private SlayerDropPrioritizerOverlay overlay;
 
     private String currentTask = "";
-    private final Set<String> currentTaskDrops = new HashSet<>();
+    final Set<String> currentTaskDrops = new HashSet<>();
     private final Set<Integer> resolvedNpcIds = new HashSet<>();
+    private PriorityItemClassifier classifier;
 
     private String normalizeItemName(String itemName) {
         itemName = net.runelite.client.util.Text.removeTags(itemName);
@@ -82,7 +83,7 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
         return itemName;
     }
 
-    private int lastCombatTick = -100;
+    int lastCombatTick = -100;
 
     private static final int DEFAULT_COMBAT_TIMEOUT = 50;
 
@@ -99,6 +100,8 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
     protected void startUp() {
         log.info("[Status] Plugin Started");
 
+        classifier = new PriorityItemClassifier(itemManager, client, currentTaskDrops, config);
+
         overlayManager.add(overlay);
 
         checkTask();
@@ -110,6 +113,12 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
         currentTaskDrops.clear();
         resolvedNpcIds.clear();
+        dropCache.clear();
+
+        if (classifier != null) {
+            classifier.clearCache();
+            classifier = null;
+        }
 
         currentNpc = "";
         currentNpcId = -1;
@@ -173,11 +182,11 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
         Actor interacting = player.getInteracting();
 
         if (interacting == null) {
-            log.info("[Tick] No interaction");
+            log.debug("[Tick] No interaction");
             return;
         }
 
-        log.info(
+        log.debug(
                 "[Tick] Interacting with: {} ({})",
                 interacting.getName(),
                 interacting.getClass().getSimpleName());
@@ -207,22 +216,29 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
             if (dropCache.containsKey(target.getId())) {
                 currentTaskDrops.clear();
                 currentTaskDrops.addAll(dropCache.get(target.getId()));
-            } else if (currentTaskDrops.isEmpty() &&
-                    !resolvedNpcIds.contains(target.getId()))
+            } else if (!resolvedNpcIds.contains(target.getId())) {
                 log.info(
                         "[Wiki] Resolving drops for {} ({})",
                         target.getName(),
                         target.getId());
-
-            resolvedNpcIds.add(target.getId());
-
-            resolveWikiPage(target.getId());
+                resolvedNpcIds.add(target.getId());
+                resolveWikiPage(target.getId());
+            }
         }
     }
 
     private void resolveWikiPage(int npcId) {
+        okhttp3.HttpUrl url = new okhttp3.HttpUrl.Builder()
+                .scheme("https")
+                .host("oldschool.runescape.wiki")
+                .addPathSegment("w")
+                .addPathSegment("Special:Lookup")
+                .addQueryParameter("type", "npc")
+                .addQueryParameter("id", String.valueOf(npcId))
+                .build();
+
         Request request = new Request.Builder()
-                .url("https://oldschool.runescape.wiki/w/Special:Lookup?type=npc&id=" + npcId)
+                .url(url)
                 .build();
 
         okHttpClient.newCall(request).enqueue(new Callback() {
@@ -233,13 +249,20 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
             @Override
             public void onResponse(Call call, Response response) throws IOException {
-                String page = response.request()
-                        .url()
-                        .toString()
-                        .split("/w/")[1]
-                        .split("\\?")[0]
-                        .split("#")[0];
+                if (!response.isSuccessful()) {
+                    log.error("[Wiki] Lookup unsuccessful: HTTP {}", response.code());
+                    response.close();
+                    return;
+                }
 
+                List<String> pathSegments = response.request().url().pathSegments();
+                if (pathSegments.size() < 2 || !"w".equals(pathSegments.get(0))) {
+                    log.error("[Wiki] Unexpected URL format: {}", response.request().url());
+                    response.close();
+                    return;
+                }
+
+                String page = pathSegments.get(1);
                 lastWikiPage = page;
 
                 log.info("[Wiki] Resolved page: {}", page);
@@ -252,9 +275,18 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
     }
 
     private void fetchDrops(String page) {
+        okhttp3.HttpUrl url = new okhttp3.HttpUrl.Builder()
+                .scheme("https")
+                .host("oldschool.runescape.wiki")
+                .addPathSegment("api.php")
+                .addQueryParameter("action", "parse")
+                .addQueryParameter("page", page)
+                .addQueryParameter("format", "json")
+                .addQueryParameter("prop", "wikitext")
+                .build();
+
         Request request = new Request.Builder()
-                .url("https://oldschool.runescape.wiki/api.php?action=parse&page=" + page
-                        + "&format=json&prop=wikitext")
+                .url(url)
                 .build();
 
         okHttpClient.newCall(request).enqueue(new Callback() {
@@ -270,12 +302,32 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                     return;
                 }
 
-                String wikiText = gson
-                        .fromJson(response.body().string(), JsonObject.class)
-                        .getAsJsonObject("parse")
-                        .getAsJsonObject("wikitext")
-                        .get("*")
-                        .getAsString();
+                if (response.body() == null) {
+                    response.close();
+                    return;
+                }
+
+                String responseBody = response.body().string();
+                JsonObject jsonObject = gson.fromJson(responseBody, JsonObject.class);
+                if (jsonObject == null || !jsonObject.has("parse")) {
+                    log.error("[Wiki] Invalid API response: {}", responseBody);
+                    response.close();
+                    return;
+                }
+
+                JsonObject parse = jsonObject.getAsJsonObject("parse");
+                if (parse == null || !parse.has("wikitext")) {
+                    response.close();
+                    return;
+                }
+
+                JsonObject wikitext = parse.getAsJsonObject("wikitext");
+                if (wikitext == null || !wikitext.has("*")) {
+                    response.close();
+                    return;
+                }
+
+                String wikiText = wikitext.get("*").getAsString();
 
                 Pattern p = Pattern.compile("\\{\\{DropsLine.*?\\}\\}", Pattern.DOTALL);
                 Matcher m = p.matcher(wikiText);
@@ -287,25 +339,14 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                             .replace("\r", "\\r")
                             .replace("\n", "\\n");
 
-                    log.info("[Wiki] DropsLine {}: {}", count, sample);
+                    log.debug("[Wiki] DropsLine {}: {}", count, sample);
                     count++;
                 }
 
-                log.info(
-                        "[Wiki] Length: {}",
-                        wikiText.length());
-
-                log.info(
-                        "[Wiki] Contains DropsLine? {}",
-                        wikiText.contains("DropsLine"));
-
-                log.info(
-                        "[Wiki] Contains DropsTableHead? {}",
-                        wikiText.contains("DropsTableHead"));
-
-                log.info(
-                        "[Wiki] Contains itemid=? {}",
-                        wikiText.contains("itemid="));
+                log.debug("[Wiki] Length: {}", wikiText.length());
+                log.debug("[Wiki] Contains DropsLine? {}", wikiText.contains("DropsLine"));
+                log.debug("[Wiki] Contains DropsTableHead? {}", wikiText.contains("DropsTableHead"));
+                log.debug("[Wiki] Contains itemid=? {}", wikiText.contains("itemid="));
 
                 int dropPos = wikiText.indexOf("Drops");
 
@@ -313,12 +354,10 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                     int start = Math.max(0, dropPos - 200);
                     int end = Math.min(wikiText.length(), dropPos + 1000);
 
-                    log.info(
-                            "[Wiki] Around Drops:\n{}",
-                            wikiText.substring(start, end));
+                    log.debug("[Wiki] Around Drops:\n{}", wikiText.substring(start, end));
                 }
 
-                Matcher matcher = Pattern.compile("\\{\\{DropsLine\\|name=([^|}]+)")
+                Matcher matcher = Pattern.compile("\\{\\{\\s*DropsLine\\s*\\|[^}]*?\\b[Nn]ame\\s*=\\s*([^|}]+)")
                         .matcher(wikiText);
 
                 while (matcher.find()) {
@@ -326,11 +365,12 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
                     currentTaskDrops.add(itemName);
 
-                    log.info("[Wiki] Drop Found: {}", itemName);
+                    log.debug("[Wiki] Drop Found: {}", itemName);
                 }
                 log.info(
-                        "[Wiki] Loaded {} item ids",
-                        currentTaskDrops.size());
+                        "[Wiki] Loaded {} items from wiki for page: {}",
+                        currentTaskDrops.size(),
+                        page);
                 dropCache.put(
                         currentNpcId,
                         new HashSet<>(currentTaskDrops));
@@ -378,7 +418,7 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
         if (config.dropDisplayMode() == DropDisplayMode.HIDE) {
             processHideMode(entries, groundItems);
         } else if (config.dropDisplayMode() == DropDisplayMode.DEPRIORITIZE) {
-            processDeprioritizeMode(entries, groundItems);
+            processDeprioritizeMode(entries);
         }
     }
 
@@ -399,7 +439,7 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
             String normalizedItemName = normalizeItemName(entry.getTarget());
             String normalizedOption = normalizeItemName(entry.getOption()).trim();
             int itemId = entry.getIdentifier();
-            boolean isPriority = isPriorityItem(normalizedItemName, itemId);
+            boolean isPriority = isPriorityItem(entry, normalizedItemName);
 
             ClassifiedMenuItem item = new ClassifiedMenuItem(
                     entry,
@@ -407,15 +447,10 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                     normalizedItemName,
                     normalizedOption,
                     isPriority,
-                    itemId);
+                    itemId,
+                    0); // Score is no longer used for sorting
 
             groundItems.add(item);
-
-            log.debug("[Classify] {} ({}) | option={} | priority={}",
-                    normalizedItemName,
-                    itemId,
-                    normalizedOption,
-                    isPriority);
         }
 
         return groundItems;
@@ -437,31 +472,8 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
      * Determines if an item should be prioritized.
      * Supports both task drops and valuable items.
      */
-    private boolean isPriorityItem(String normalizedItemName, int itemId) {
-        // Task drops are always considered unless filtered by price
-        if (currentTaskDrops.contains(normalizedItemName)) {
-            if (config.prioritizationMode() == PrioritizationMode.VALUABLE_TASK_DROPS) {
-                int gePrice = itemManager.getItemPrice(itemId);
-                boolean valuable = gePrice >= config.minimumPriorityValue();
-                log.debug("[Value Check] {} id={} price={} valuable={}",
-                        normalizedItemName, itemId, gePrice, valuable);
-                return valuable;
-            }
-            return true;
-        }
-
-        // Non-task items can be prioritized if valuable
-        if (config.prioritizationMode() == PrioritizationMode.VALUABLE_TASK_DROPS) {
-            int gePrice = itemManager.getItemPrice(itemId);
-            boolean valuable = gePrice >= config.minimumPriorityValue();
-            if (valuable) {
-                log.debug("[Valuable Non-Task] {} id={} price={}",
-                        normalizedItemName, itemId, gePrice);
-            }
-            return valuable;
-        }
-
-        return false;
+    private boolean isPriorityItem(MenuEntry entry, String normalizedItemName) {
+        return classifier != null && classifier.isPriority(entry, normalizedItemName);
     }
 
     /**
@@ -470,91 +482,129 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
      */
     private void processHideMode(MenuEntry[] entries, List<ClassifiedMenuItem> groundItems) {
         List<MenuEntry> result = new ArrayList<>();
+        java.util.Set<Integer> excludedIndices = new java.util.HashSet<>();
 
-        // Build a set of ground item indices for faster lookup
-        java.util.Set<Integer> groundIndices = new java.util.HashSet<>();
         for (ClassifiedMenuItem item : groundItems) {
-            groundIndices.add(item.getOriginalIndex());
+            boolean isExamine = "Examine".equalsIgnoreCase(item.getNormalizedOption());
+            boolean shouldHide = false;
+            
+            if (item.isPriority()) {
+                if (isExamine && !config.prioritizeExamine()) {
+                    shouldHide = true;
+                }
+            } else {
+                shouldHide = true;
+            }
+
+            if (shouldHide) {
+                excludedIndices.add(item.getOriginalIndex());
+                log.debug("[HIDE] Remove: {}", item.getNormalizedItemName());
+            } else {
+                log.debug("[HIDE] Keep: {}", item.getNormalizedItemName());
+            }
         }
 
-        // Add all non-ground items
         for (int i = 0; i < entries.length; i++) {
-            if (!groundIndices.contains(i)) {
+            if (!excludedIndices.contains(i)) {
                 result.add(entries[i]);
             }
         }
 
-        // Add only priority ground items
-        for (ClassifiedMenuItem item : groundItems) {
-            if (item.isPriority()) {
-                result.add(item.getEntry());
-                log.debug("[HIDE] Keep: {}", item.getNormalizedItemName());
-            } else {
-                log.debug("[HIDE] Remove: {}", item.getNormalizedItemName());
-            }
-        }
-
         client.setMenuEntries(result.toArray(new MenuEntry[0]));
-        log.info("[Menu] HIDE mode applied, {} items hidden",
-                groundItems.size() - (int) groundItems.stream().filter(ClassifiedMenuItem::isPriority).count());
+        log.info("[Menu] HIDE mode applied, {} items hidden", excludedIndices.size());
     }
 
     /**
-     * DEPRIORITIZE mode: reorders ground items, keeping priority items first.
-     * Preserves all non-ground menu entries at their original positions.
+     * DEPRIORITIZE mode: reorders the ground items block in the menu.
+     * Places non-priority items at the bottom of the ground items block, and priority items at the top.
+     * Respects examine options and config.prioritizeExamine setting, ensuring they are ordered correctly
+     * around other menu options (like Walk here).
      */
-    private void processDeprioritizeMode(MenuEntry[] entries, List<ClassifiedMenuItem> groundItems) {
-        // Separate priority and non-priority items, grouped by "Take" and "Examine"
-        List<ClassifiedMenuItem> priorityTake = new ArrayList<>();
-        List<ClassifiedMenuItem> priorityExamine = new ArrayList<>();
-        List<ClassifiedMenuItem> nonPriorityTake = new ArrayList<>();
-        List<ClassifiedMenuItem> nonPriorityExamine = new ArrayList<>();
+    private void processDeprioritizeMode(MenuEntry[] entries) {
+        List<MenuEntry> cancelEntries = new ArrayList<>();
+        List<MenuEntry> otherEntries = new ArrayList<>();
+        List<ClassifiedMenuItem> prioritized = new ArrayList<>();
+        List<ClassifiedMenuItem> deprioritized = new ArrayList<>();
 
-        for (ClassifiedMenuItem item : groundItems) {
-            if (item.isPriority()) {
-                if ("Take".equalsIgnoreCase(item.getNormalizedOption())) {
-                    priorityTake.add(item);
-                } else if ("Examine".equalsIgnoreCase(item.getNormalizedOption())) {
-                    priorityExamine.add(item);
+        for (int i = 0; i < entries.length; i++) {
+            MenuEntry entry = entries[i];
+            MenuAction action = entry.getType();
+
+            if (action == MenuAction.CANCEL || "Cancel".equalsIgnoreCase(entry.getOption())) {
+                cancelEntries.add(entry);
+            } else if (isGroundItemAction(action)) {
+                String normalizedItemName = normalizeItemName(entry.getTarget());
+                String normalizedOption = normalizeItemName(entry.getOption()).trim();
+                int itemId = entry.getIdentifier();
+                boolean isPriority = isPriorityItem(entry, normalizedItemName);
+                boolean isExamine = action == MenuAction.EXAMINE_ITEM_GROUND;
+
+                ClassifiedMenuItem item = new ClassifiedMenuItem(
+                        entry,
+                        i,
+                        normalizedItemName,
+                        normalizedOption,
+                        isPriority,
+                        itemId,
+                        0);
+
+                boolean shouldDeprioritize = false;
+                if (isPriority) {
+                    if (isExamine && !config.prioritizeExamine()) {
+                        shouldDeprioritize = true;
+                    }
+                } else {
+                    shouldDeprioritize = true;
+                }
+
+                if (shouldDeprioritize) {
+                    deprioritized.add(item);
+                } else {
+                    prioritized.add(item);
                 }
             } else {
-                if ("Take".equalsIgnoreCase(item.getNormalizedOption())) {
-                    nonPriorityTake.add(item);
-                } else if ("Examine".equalsIgnoreCase(item.getNormalizedOption())) {
-                    nonPriorityExamine.add(item);
-                }
+                otherEntries.add(entry);
             }
         }
 
-        // Build reordered list of ground items
-        List<ClassifiedMenuItem> reordered = new ArrayList<>();
-        reordered.addAll(priorityTake);
-        if (config.prioritizeExamine()) {
-            reordered.addAll(priorityExamine);
-        }
-        reordered.addAll(nonPriorityTake);
+        // Sort deprioritized items if prioritizeExamine is OFF
         if (!config.prioritizeExamine()) {
-            reordered.addAll(nonPriorityExamine);
+            deprioritized.sort((a, b) -> Integer.compare(getDeprioritizedCategory(a), getDeprioritizedCategory(b)));
+        }
+
+        // Reconstruct the menu entries list (bottom of menu to top)
+        List<MenuEntry> newEntriesList = new ArrayList<>();
+
+        // 1. Cancel entries at the very bottom (lowest index)
+        newEntriesList.addAll(cancelEntries);
+
+        // 2. Deprioritized ground items
+        for (ClassifiedMenuItem item : deprioritized) {
+            newEntriesList.add(item.getEntry());
+        }
+
+        // 3. Other entries (like Walk here, NPC options)
+        newEntriesList.addAll(otherEntries);
+
+        // 4. Prioritized ground items at the top (highest index)
+        for (ClassifiedMenuItem item : prioritized) {
+            newEntriesList.add(item.getEntry());
+        }
+
+        client.setMenuEntries(newEntriesList.toArray(new MenuEntry[0]));
+        log.info("[Menu] DEPRIORITIZE mode applied: reordered menu with {} prioritized and {} deprioritized ground items", 
+                prioritized.size(), deprioritized.size());
+    }
+
+    private int getDeprioritizedCategory(ClassifiedMenuItem item) {
+        boolean isPriority = item.isPriority();
+        boolean isExamine = item.getEntry().getType() == MenuAction.EXAMINE_ITEM_GROUND;
+
+        if (isPriority) {
+            // Must be Examine (since shouldDeprioritize was true and isPriority is true)
+            return 1; // Priority Examine
         } else {
-            reordered.addAll(nonPriorityExamine);
-        }
-
-        // Apply reordering to original array positions
-        for (int i = 0; i < reordered.size() && i < groundItems.size(); i++) {
-            int targetIdx = groundItems.get(i).getOriginalIndex();
-            entries[targetIdx] = reordered.get(i).getEntry();
-        }
-
-        client.setMenuEntries(entries);
-        log.info("[Menu] DEPRIORITIZE mode applied: {} priority items first",
-                priorityTake.size() + (config.prioritizeExamine() ? priorityExamine.size() : 0));
-
-        // Debug logging
-        if (log.isDebugEnabled()) {
-            log.debug("[DEPRIORITIZE] Final order:");
-            for (ClassifiedMenuItem item : reordered) {
-                log.debug("  - {} ({})", item.getNormalizedItemName(), item.isPriority() ? "PRIORITY" : "NON-PRIORITY");
-            }
+            return isExamine ? 0 : 2; // Non-priority Examine (0) vs Non-priority Take (2)
         }
     }
 

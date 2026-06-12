@@ -7,3 +7,5 @@ build
 nbactions.xml
 nb-configuration.xml
 nbproject/
+build.gradle
+bin/main/net/runelite/client/plugins/slayerdropprioritizer/*.class

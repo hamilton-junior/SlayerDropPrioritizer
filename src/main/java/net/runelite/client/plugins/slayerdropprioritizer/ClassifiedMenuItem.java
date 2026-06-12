@@ -14,4 +14,5 @@ public class ClassifiedMenuItem {
     String normalizedOption;
     boolean isPriority;
     int itemId;
+    int score;
 }
