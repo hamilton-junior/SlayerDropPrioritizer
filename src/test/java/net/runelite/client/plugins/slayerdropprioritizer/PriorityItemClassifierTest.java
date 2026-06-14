@@ -151,7 +151,7 @@ public class PriorityItemClassifierTest {
         private int minimumPriorityValue = 0;
         private DropDisplayMode dropDisplayMode = DropDisplayMode.DEPRIORITIZE;
         private boolean prioritizeExamine = true;
-        private int combatTimeout = 50;
+        private int combatTimeoutSeconds = 30;
         private boolean testMode = false;
         private String testMonsterName = "Goblin";
         private boolean supportCollapsedItems = true;
@@ -182,8 +182,8 @@ public class PriorityItemClassifierTest {
         }
 
         @Override
-        public int combatTimeout() {
-            return combatTimeout;
+        public int combatTimeoutSeconds() {
+            return combatTimeoutSeconds;
         }
 
         @Override

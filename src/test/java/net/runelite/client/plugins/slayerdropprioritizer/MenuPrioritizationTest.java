@@ -34,7 +34,7 @@ public class MenuPrioritizationTest {
     private int minimumPriorityValue = 0;
     private DropDisplayMode dropDisplayMode = DropDisplayMode.DEPRIORITIZE;
     private boolean prioritizeExamine = true;
-    private int combatTimeout = 50;
+    private int combatTimeoutSeconds = 30;
 
     @Before
     public void setUp() {
@@ -49,12 +49,14 @@ public class MenuPrioritizationTest {
         when(config.minimumPriorityValue()).thenAnswer(inv -> minimumPriorityValue);
         when(config.dropDisplayMode()).thenAnswer(inv -> dropDisplayMode);
         when(config.prioritizeExamine()).thenAnswer(inv -> prioritizeExamine);
-        when(config.combatTimeout()).thenAnswer(inv -> combatTimeout);
+        when(config.combatTimeoutSeconds()).thenAnswer(inv -> combatTimeoutSeconds);
         // New config methods - explicit stubs so enum returns are never null
         when(config.priorityValueSource()).thenReturn(PriorityValueSource.GE_ONLY);
-        when(config.enableCluePriority()).thenReturn(false);
+        when(config.showClueScrolls()).thenReturn(ClueScrollDisplay.MODE);
+        when(config.prioritizeClueScrolls()).thenReturn(ClueScrollPriority.OFF);
         when(config.enableRarePriority()).thenReturn(false);
-        when(config.maxRareDenominator()).thenReturn(512);
+        when(config.rareThreshold()).thenReturn(512);
+        when(config.ultraRareThreshold()).thenReturn(2500);
         when(config.alwaysPriorityItems()).thenReturn("");
         when(config.alwaysIgnoreItems()).thenReturn("");
         when(config.interestingDropsOnly()).thenReturn(false);
@@ -62,6 +64,16 @@ public class MenuPrioritizationTest {
         when(config.priorityMarker()).thenReturn(PriorityMarker.NONE);
         when(config.showItemValueInMenu()).thenReturn(false);
         when(config.itemValueDisplay()).thenReturn(ItemValueDisplay.GE);
+        when(config.highlightTaskItems()).thenReturn(false);
+        when(config.highlightColor()).thenReturn(new java.awt.Color(0x00FF00));
+        when(config.highlightAboveValueOnly()).thenReturn(false);
+        when(config.highlightByTier()).thenReturn(false);
+        when(config.highlightColorRare()).thenReturn(new java.awt.Color(0xFF4040));
+        when(config.highlightColorUltraRare()).thenReturn(new java.awt.Color(0xAA00FF));
+        when(config.highlightColorValuable()).thenReturn(new java.awt.Color(0xFFA500));
+        when(config.notifyPriorityDrops()).thenReturn(false);
+        when(config.cacheDropTables()).thenReturn(false);
+        when(config.showDebugOverlay()).thenReturn(false);
         when(config.testMode()).thenReturn(false);
         when(config.testMonsterName()).thenReturn("Goblin");
         when(config.supportCollapsedItems()).thenReturn(true);
@@ -89,6 +101,9 @@ public class MenuPrioritizationTest {
                 bind(com.google.gson.Gson.class).toInstance(new com.google.gson.Gson());
                 bind(net.runelite.client.ui.overlay.OverlayManager.class).toInstance(mock(net.runelite.client.ui.overlay.OverlayManager.class));
                 bind(SlayerDropPrioritizerOverlay.class).toInstance(mock(SlayerDropPrioritizerOverlay.class));
+                bind(net.runelite.client.callback.ClientThread.class).toInstance(mock(net.runelite.client.callback.ClientThread.class));
+                bind(java.util.concurrent.ScheduledExecutorService.class).toInstance(mock(java.util.concurrent.ScheduledExecutorService.class));
+                bind(net.runelite.client.Notifier.class).toInstance(mock(net.runelite.client.Notifier.class));
             }
         });
 

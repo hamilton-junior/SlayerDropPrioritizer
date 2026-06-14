@@ -84,11 +84,8 @@ public class PriorityItemClassifier {
             return true;
         }
 
-        // 3. Clue scrolls
-        if (config.enableCluePriority() && isClueScroll(normalizedItemName)) {
-            log.debug("[Classifier] Clue scroll: {}", normalizedItemName);
-            return true;
-        }
+        // Note: clue scroll handling is done in the plugin (it needs ordering control),
+        // not here in the base priority classification.
 
         // 4. Minimum value threshold
         int minPrice = config.minimumPriorityValue();
@@ -114,10 +111,11 @@ public class PriorityItemClassifier {
             // VALUABLE_TASK_DROPS with minPrice > 0: already checked above, value was below threshold
         }
 
-        // 6. Wiki rarity check (applies to task drops; step 5 already handled the non-interesting path)
+        // 6. Wiki rarity check. A drop is "rare enough" when its rate is 1/N or rarer,
+        //    i.e. the (effective) denominator is >= the Rare threshold.
         if (config.enableRarePriority()) {
             Double denominator = dropRarity.get(normalizedItemName);
-            if (denominator != null && denominator <= config.maxRareDenominator()) {
+            if (denominator != null && denominator >= config.rareThreshold()) {
                 log.debug("[Classifier] Rare drop: {} (1/{})", normalizedItemName, denominator.intValue());
                 return true;
             }
@@ -140,8 +138,15 @@ public class PriorityItemClassifier {
         return getGePrice(itemId) * quantity;
     }
 
-    private boolean isClueScroll(String name) {
-        return name.toLowerCase().startsWith("clue scroll");
+    /**
+     * Value used for the Minimum Priority Value threshold (respects priorityValueSource).
+     */
+    public int getPriorityValue(MenuEntry entry) {
+        return getEffectiveValue(entry.getIdentifier(), extractQuantityFromTile(entry));
+    }
+
+    public boolean isClueScroll(String name) {
+        return name != null && name.toLowerCase().startsWith("clue scroll");
     }
 
     private int getEffectiveValue(int itemId, int quantity) {

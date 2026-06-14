@@ -15,4 +15,5 @@ public class ClassifiedMenuItem {
     boolean isPriority;
     int itemId;
     int score;
+    boolean clueScroll;
 }
