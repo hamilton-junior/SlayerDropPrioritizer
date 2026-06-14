@@ -28,13 +28,15 @@ import okhttp3.Response;
 import javax.inject.Inject;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.HashMap;
-import java.util.Map;
 
 @Slf4j
 @PluginDescriptor(name = "Slayer Drop Prioritizer", description = "Deprioritizes items outside task drop table.", tags = {
@@ -66,30 +68,26 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
     private String currentTask = "";
     final Set<String> currentTaskDrops = new HashSet<>();
+    final Map<String, Double> currentDropRarity = new HashMap<>();
+
     private final Set<Integer> resolvedNpcIds = new HashSet<>();
+    private final Map<Integer, Set<String>> dropCache = new HashMap<>();
+    private final Map<Integer, Map<String, Double>> dropRarityCache = new HashMap<>();
+
     private PriorityItemClassifier classifier;
 
-    private String normalizeItemName(String itemName) {
-        itemName = net.runelite.client.util.Text.removeTags(itemName);
-
-        if (config.supportCollapsedItems()) {
-            itemName = itemName.replaceAll("\\s+x\\s+\\d+$", "");
-        }
-
-        itemName = itemName
-                .replaceAll("\\s*\\([^)]*\\)$", "")
-                .trim();
-
-        return itemName;
-    }
-
     int lastCombatTick = -100;
-
-    private static final int DEFAULT_COMBAT_TIMEOUT = 50;
 
     private String currentNpc = "";
     private int currentNpcId = -1;
     private String lastWikiPage = "";
+
+    private static final Pattern DROPS_LINE_NAME_PATTERN =
+            Pattern.compile("\\b[Nn]ame\\s*=\\s*([^|\n}]+)");
+    private static final Pattern DROPS_LINE_RARITY_PATTERN =
+            Pattern.compile("\\b[Rr]arity\\s*=\\s*([^|\n}]+)");
+    private static final Pattern RARITY_FRACTION_PATTERN =
+            Pattern.compile("\\d+/(\\d+)");
 
     @Provides
     SlayerDropPrioritizerConfig provideConfig(ConfigManager configManager) {
@@ -99,27 +97,23 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
     @Override
     protected void startUp() {
         log.info("[Status] Plugin Started");
-
-        classifier = new PriorityItemClassifier(itemManager, client, currentTaskDrops, config);
-
+        classifier = new PriorityItemClassifier(itemManager, client, currentTaskDrops, currentDropRarity, config);
         overlayManager.add(overlay);
-
         checkTask();
     }
 
     @Override
     protected void shutDown() {
         overlayManager.remove(overlay);
-
         currentTaskDrops.clear();
+        currentDropRarity.clear();
         resolvedNpcIds.clear();
         dropCache.clear();
-
+        dropRarityCache.clear();
         if (classifier != null) {
             classifier.clearCache();
             classifier = null;
         }
-
         currentNpc = "";
         currentNpcId = -1;
         lastWikiPage = "";
@@ -129,7 +123,6 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
         String task = config.testMode()
                 ? config.testMonsterName()
                 : configManager.getConfiguration("slayer", "taskName");
-
         updateTask(task);
     }
 
@@ -137,18 +130,15 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
         if (task == null || task.isEmpty()) {
             currentTask = "";
             currentTaskDrops.clear();
-
+            currentDropRarity.clear();
             log.info("[Task] Empty task detected");
-
             return;
         }
-
         if (!task.equalsIgnoreCase(currentTask)) {
             currentTask = task;
-
             currentTaskDrops.clear();
+            currentDropRarity.clear();
             resolvedNpcIds.clear();
-
             log.info("[Task] Target updated to: {}", currentTask);
         }
     }
@@ -156,6 +146,9 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
     @Subscribe
     public void onConfigChanged(ConfigChanged event) {
         if ("slayerdropprioritizer".equals(event.getGroup())) {
+            if (classifier != null) {
+                classifier.refreshCustomLists();
+            }
             checkTask();
         }
     }
@@ -163,41 +156,25 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
     @Subscribe
     public void onGameTick(GameTick event) {
         Player player = client.getLocalPlayer();
-
         if (player == null) {
-            log.debug("[Tick] Player is null");
             return;
         }
-
         if (!config.enableDeprioritization()) {
-            log.debug("[Tick] Plugin disabled");
             return;
         }
-
         if (currentTask.isEmpty()) {
-            log.debug("[Tick] Current task is empty");
             return;
         }
 
         Actor interacting = player.getInteracting();
-
         if (interacting == null) {
-            log.debug("[Tick] No interaction");
             return;
         }
 
-        log.debug(
-                "[Tick] Interacting with: {} ({})",
-                interacting.getName(),
-                interacting.getClass().getSimpleName());
-
         NPC target = null;
-
         if (interacting instanceof NPC) {
             NPC npc = (NPC) interacting;
-
-            if (npc.getName() != null &&
-                    npc.getName().toLowerCase().contains(currentTask.toLowerCase())) {
+            if (npc.getName() != null && npc.getName().toLowerCase().contains(currentTask.toLowerCase())) {
                 target = npc;
             }
         }
@@ -205,22 +182,19 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
         if (target != null) {
             currentNpc = target.getName();
             currentNpcId = target.getId();
-
             lastCombatTick = client.getTickCount();
-
-            log.info(
-                    "[Combat] Target found: {} ({})",
-                    currentNpc,
-                    currentNpcId);
+            log.info("[Combat] Target found: {} ({})", currentNpc, currentNpcId);
 
             if (dropCache.containsKey(target.getId())) {
                 currentTaskDrops.clear();
                 currentTaskDrops.addAll(dropCache.get(target.getId()));
+                currentDropRarity.clear();
+                Map<String, Double> cachedRarity = dropRarityCache.get(target.getId());
+                if (cachedRarity != null) {
+                    currentDropRarity.putAll(cachedRarity);
+                }
             } else if (!resolvedNpcIds.contains(target.getId())) {
-                log.info(
-                        "[Wiki] Resolving drops for {} ({})",
-                        target.getName(),
-                        target.getId());
+                log.info("[Wiki] Resolving drops for {} ({})", target.getName(), target.getId());
                 resolvedNpcIds.add(target.getId());
                 resolveWikiPage(target.getId());
             }
@@ -237,10 +211,7 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                 .addQueryParameter("id", String.valueOf(npcId))
                 .build();
 
-        Request request = new Request.Builder()
-                .url(url)
-                .build();
-
+        Request request = new Request.Builder().url(url).build();
         okHttpClient.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
@@ -254,21 +225,16 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                     response.close();
                     return;
                 }
-
                 List<String> pathSegments = response.request().url().pathSegments();
                 if (pathSegments.size() < 2 || !"w".equals(pathSegments.get(0))) {
                     log.error("[Wiki] Unexpected URL format: {}", response.request().url());
                     response.close();
                     return;
                 }
-
                 String page = pathSegments.get(1);
                 lastWikiPage = page;
-
                 log.info("[Wiki] Resolved page: {}", page);
-
                 response.close();
-
                 fetchDrops(page);
             }
         });
@@ -285,10 +251,7 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                 .addQueryParameter("prop", "wikitext")
                 .build();
 
-        Request request = new Request.Builder()
-                .url(url)
-                .build();
-
+        Request request = new Request.Builder().url(url).build();
         okHttpClient.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
@@ -297,101 +260,81 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
             @Override
             public void onResponse(Call call, Response response) throws IOException {
-                if (!response.isSuccessful()) {
-                    response.close();
-                    return;
-                }
-
-                if (response.body() == null) {
+                if (!response.isSuccessful() || response.body() == null) {
                     response.close();
                     return;
                 }
 
                 String responseBody = response.body().string();
+                response.close();
+
                 JsonObject jsonObject = gson.fromJson(responseBody, JsonObject.class);
                 if (jsonObject == null || !jsonObject.has("parse")) {
-                    log.error("[Wiki] Invalid API response: {}", responseBody);
-                    response.close();
+                    log.error("[Wiki] Invalid API response");
                     return;
                 }
-
                 JsonObject parse = jsonObject.getAsJsonObject("parse");
-                if (parse == null || !parse.has("wikitext")) {
-                    response.close();
-                    return;
-                }
-
+                if (parse == null || !parse.has("wikitext")) return;
                 JsonObject wikitext = parse.getAsJsonObject("wikitext");
-                if (wikitext == null || !wikitext.has("*")) {
-                    response.close();
-                    return;
-                }
+                if (wikitext == null || !wikitext.has("*")) return;
 
                 String wikiText = wikitext.get("*").getAsString();
-
-                Pattern p = Pattern.compile("\\{\\{DropsLine.*?\\}\\}", Pattern.DOTALL);
-                Matcher m = p.matcher(wikiText);
-
-                int count = 0;
-
-                while (m.find() && count < 5) {
-                    String sample = m.group()
-                            .replace("\r", "\\r")
-                            .replace("\n", "\\n");
-
-                    log.debug("[Wiki] DropsLine {}: {}", count, sample);
-                    count++;
-                }
-
-                log.debug("[Wiki] Length: {}", wikiText.length());
-                log.debug("[Wiki] Contains DropsLine? {}", wikiText.contains("DropsLine"));
-                log.debug("[Wiki] Contains DropsTableHead? {}", wikiText.contains("DropsTableHead"));
-                log.debug("[Wiki] Contains itemid=? {}", wikiText.contains("itemid="));
-
-                int dropPos = wikiText.indexOf("Drops");
-
-                if (dropPos > -1) {
-                    int start = Math.max(0, dropPos - 200);
-                    int end = Math.min(wikiText.length(), dropPos + 1000);
-
-                    log.debug("[Wiki] Around Drops:\n{}", wikiText.substring(start, end));
-                }
-
-                Matcher matcher = Pattern.compile("\\{\\{\\s*DropsLine\\s*\\|[^}]*?\\b[Nn]ame\\s*=\\s*([^|}]+)")
-                        .matcher(wikiText);
-
-                while (matcher.find()) {
-                    String itemName = matcher.group(1).trim();
-
-                    currentTaskDrops.add(itemName);
-
-                    log.debug("[Wiki] Drop Found: {}", itemName);
-                }
-                log.info(
-                        "[Wiki] Loaded {} items from wiki for page: {}",
-                        currentTaskDrops.size(),
-                        page);
-                dropCache.put(
-                        currentNpcId,
-                        new HashSet<>(currentTaskDrops));
-
-                response.close();
+                parseDropsFromWikiText(wikiText);
             }
         });
+    }
+
+    /**
+     * Splits wikitext on DropsLine template openings, parses Name and Rarity from each block,
+     * then stores results into the current task's drop sets and caches.
+     */
+    private void parseDropsFromWikiText(String wikiText) {
+        Set<String> drops = new HashSet<>();
+        Map<String, Double> rarityMap = new HashMap<>();
+
+        // Split on each DropsLine template start; index 0 is text before the first one
+        String[] blocks = wikiText.split("\\{\\{\\s*DropsLine");
+        for (int i = 1; i < blocks.length; i++) {
+            String block = blocks[i];
+            int end = block.indexOf("}}");
+            if (end < 0) continue;
+            String templateBody = block.substring(0, end);
+
+            Matcher nameMatcher = DROPS_LINE_NAME_PATTERN.matcher(templateBody);
+            if (!nameMatcher.find()) continue;
+            String itemName = nameMatcher.group(1).trim();
+            drops.add(itemName);
+
+            Matcher rarityMatcher = DROPS_LINE_RARITY_PATTERN.matcher(templateBody);
+            if (rarityMatcher.find()) {
+                String rarityText = rarityMatcher.group(1).trim();
+                Matcher fractionMatcher = RARITY_FRACTION_PATTERN.matcher(rarityText);
+                if (fractionMatcher.find()) {
+                    double denominator = Double.parseDouble(fractionMatcher.group(1));
+                    rarityMap.put(itemName, denominator);
+                    log.debug("[Wiki] Rarity for {}: 1/{}", itemName, (int) denominator);
+                }
+            }
+        }
+
+        currentTaskDrops.addAll(drops);
+        currentDropRarity.clear();
+        currentDropRarity.putAll(rarityMap);
+        dropCache.put(currentNpcId, new HashSet<>(drops));
+        dropRarityCache.put(currentNpcId, new HashMap<>(rarityMap));
+
+        log.info("[Wiki] Loaded {} drops ({} with rarity) for NPC id={}", drops.size(), rarityMap.size(), currentNpcId);
     }
 
     @Subscribe
     public void onMenuOpened(MenuOpened event) {
         if (!config.enableDeprioritization()) {
-            log.debug("[Menu] Plugin disabled");
             return;
         }
-
         if (currentTaskDrops.isEmpty()) {
             log.debug("[Menu] No drops loaded yet");
             return;
         }
-
         if ((client.getTickCount() - lastCombatTick) > config.combatTimeout()) {
             log.debug("[Menu] Outside combat grace period");
             return;
@@ -399,163 +342,120 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
         MenuEntry[] entries = client.getMenuEntries();
         List<ClassifiedMenuItem> groundItems = extractAndClassifyGroundItems(entries);
-
         if (groundItems.isEmpty()) {
             log.debug("[Menu] No ground items in menu");
             return;
         }
 
-        log.info("[Menu] Opened with {} ground items (drops={}, combatTicksAgo={})",
-                groundItems.size(),
-                currentTaskDrops.size(),
-                client.getTickCount() - lastCombatTick);
+        log.info("[Menu] Opened with {} ground items (mode={})", groundItems.size(), config.dropDisplayMode());
 
-        if (config.dropDisplayMode() == DropDisplayMode.SHOW) {
-            log.debug("[Menu] SHOW mode - no changes");
-            return;
+        List<MenuEntry> result;
+        DropDisplayMode mode = config.dropDisplayMode();
+
+        if (mode == DropDisplayMode.HIDE || mode == DropDisplayMode.HIDE_TAKE_ONLY) {
+            result = buildHideModeEntries(entries, groundItems, mode == DropDisplayMode.HIDE_TAKE_ONLY);
+        } else if (mode == DropDisplayMode.DEPRIORITIZE) {
+            result = buildDeprioritizeModeEntries(entries, groundItems);
+        } else {
+            // SHOW mode: no reordering, but still apply visual decorations if configured
+            if (!config.enablePriorityMarker() && !config.showItemValueInMenu()) {
+                log.debug("[Menu] SHOW mode - no changes");
+                return;
+            }
+            result = new ArrayList<>(Arrays.asList(entries));
         }
 
-        if (config.dropDisplayMode() == DropDisplayMode.HIDE) {
-            processHideMode(entries, groundItems);
-        } else if (config.dropDisplayMode() == DropDisplayMode.DEPRIORITIZE) {
-            processDeprioritizeMode(entries);
-        }
+        applyDisplayModifications(result, groundItems);
+        client.setMenuEntries(result.toArray(new MenuEntry[0]));
     }
 
-    /**
-     * Extracts and classifies all ground items from the menu.
-     */
     private List<ClassifiedMenuItem> extractAndClassifyGroundItems(MenuEntry[] entries) {
         List<ClassifiedMenuItem> groundItems = new ArrayList<>();
-
         for (int i = 0; i < entries.length; i++) {
             MenuEntry entry = entries[i];
-            MenuAction action = entry.getType();
+            if (!isGroundItemAction(entry.getType())) continue;
 
-            if (!isGroundItemAction(action)) {
-                continue;
-            }
-
-            String normalizedItemName = normalizeItemName(entry.getTarget());
+            String normalizedName = normalizeItemName(entry.getTarget());
             String normalizedOption = normalizeItemName(entry.getOption()).trim();
             int itemId = entry.getIdentifier();
-            boolean isPriority = isPriorityItem(entry, normalizedItemName);
+            boolean priority = classifier != null && classifier.isPriority(entry, normalizedName);
 
-            ClassifiedMenuItem item = new ClassifiedMenuItem(
-                    entry,
-                    i,
-                    normalizedItemName,
-                    normalizedOption,
-                    isPriority,
-                    itemId,
-                    0); // Score is no longer used for sorting
-
-            groundItems.add(item);
+            groundItems.add(new ClassifiedMenuItem(entry, i, normalizedName, normalizedOption, priority, itemId, 0));
         }
-
         return groundItems;
     }
 
     /**
-     * Checks if a menu action represents a ground item.
+     * HIDE / HIDE_TAKE_ONLY mode.
+     *
+     * HIDE: removes all ground item entries for non-priority items.
+     * HIDE_TAKE_ONLY: keeps Examine entries for non-priority items, removes only the Take entries.
      */
-    private boolean isGroundItemAction(MenuAction action) {
-        return action == MenuAction.GROUND_ITEM_FIRST_OPTION
-                || action == MenuAction.GROUND_ITEM_SECOND_OPTION
-                || action == MenuAction.GROUND_ITEM_THIRD_OPTION
-                || action == MenuAction.GROUND_ITEM_FOURTH_OPTION
-                || action == MenuAction.GROUND_ITEM_FIFTH_OPTION
-                || action == MenuAction.EXAMINE_ITEM_GROUND;
-    }
-
-    /**
-     * Determines if an item should be prioritized.
-     * Supports both task drops and valuable items.
-     */
-    private boolean isPriorityItem(MenuEntry entry, String normalizedItemName) {
-        return classifier != null && classifier.isPriority(entry, normalizedItemName);
-    }
-
-    /**
-     * HIDE mode: removes all non-priority ground items.
-     * Preserves non-ground menu entries.
-     */
-    private void processHideMode(MenuEntry[] entries, List<ClassifiedMenuItem> groundItems) {
-        List<MenuEntry> result = new ArrayList<>();
-        java.util.Set<Integer> excludedIndices = new java.util.HashSet<>();
+    private List<MenuEntry> buildHideModeEntries(MenuEntry[] entries, List<ClassifiedMenuItem> groundItems,
+            boolean takeOnly) {
+        Set<Integer> excludedIndices = new HashSet<>();
 
         for (ClassifiedMenuItem item : groundItems) {
-            boolean isExamine = "Examine".equalsIgnoreCase(item.getNormalizedOption());
-            boolean shouldHide = false;
-            
+            boolean isExamine = item.getEntry().getType() == MenuAction.EXAMINE_ITEM_GROUND;
+
             if (item.isPriority()) {
+                // Priority item: only suppress Examine if prioritizeExamine is off
                 if (isExamine && !config.prioritizeExamine()) {
-                    shouldHide = true;
+                    excludedIndices.add(item.getOriginalIndex());
                 }
             } else {
-                shouldHide = true;
-            }
-
-            if (shouldHide) {
-                excludedIndices.add(item.getOriginalIndex());
-                log.debug("[HIDE] Remove: {}", item.getNormalizedItemName());
-            } else {
-                log.debug("[HIDE] Keep: {}", item.getNormalizedItemName());
+                // Non-priority item
+                if (takeOnly && isExamine) {
+                    // HIDE_TAKE_ONLY: keep the Examine entry, drop only Take entries
+                } else {
+                    excludedIndices.add(item.getOriginalIndex());
+                }
             }
         }
 
+        List<MenuEntry> result = new ArrayList<>(entries.length);
         for (int i = 0; i < entries.length; i++) {
             if (!excludedIndices.contains(i)) {
                 result.add(entries[i]);
             }
         }
-
-        client.setMenuEntries(result.toArray(new MenuEntry[0]));
-        log.info("[Menu] HIDE mode applied, {} items hidden", excludedIndices.size());
+        log.info("[Menu] {} mode: {} entries removed", takeOnly ? "HIDE_TAKE_ONLY" : "HIDE", excludedIndices.size());
+        return result;
     }
 
     /**
-     * DEPRIORITIZE mode: reorders the ground items block in the menu.
-     * Places non-priority items at the bottom of the ground items block, and priority items at the top.
-     * Respects examine options and config.prioritizeExamine setting, ensuring they are ordered correctly
-     * around other menu options (like Walk here).
+     * DEPRIORITIZE mode: reorders ground items in the menu.
+     *
+     * Final menu order (bottom to top, matching RuneLite's index convention):
+     *   Cancel → deprioritized ground items → other entries (Walk here, NPC, …) → priority ground items
      */
-    private void processDeprioritizeMode(MenuEntry[] entries) {
+    private List<MenuEntry> buildDeprioritizeModeEntries(MenuEntry[] entries, List<ClassifiedMenuItem> groundItems) {
+        // Index the pre-classified items by their MenuEntry reference for O(1) lookup
+        Map<MenuEntry, ClassifiedMenuItem> classified = new IdentityHashMap<>();
+        for (ClassifiedMenuItem item : groundItems) {
+            classified.put(item.getEntry(), item);
+        }
+
         List<MenuEntry> cancelEntries = new ArrayList<>();
-        List<MenuEntry> otherEntries = new ArrayList<>();
         List<ClassifiedMenuItem> prioritized = new ArrayList<>();
         List<ClassifiedMenuItem> deprioritized = new ArrayList<>();
+        List<MenuEntry> otherEntries = new ArrayList<>();
 
-        for (int i = 0; i < entries.length; i++) {
-            MenuEntry entry = entries[i];
+        for (MenuEntry entry : entries) {
             MenuAction action = entry.getType();
 
             if (action == MenuAction.CANCEL || "Cancel".equalsIgnoreCase(entry.getOption())) {
                 cancelEntries.add(entry);
             } else if (isGroundItemAction(action)) {
-                String normalizedItemName = normalizeItemName(entry.getTarget());
-                String normalizedOption = normalizeItemName(entry.getOption()).trim();
-                int itemId = entry.getIdentifier();
-                boolean isPriority = isPriorityItem(entry, normalizedItemName);
-                boolean isExamine = action == MenuAction.EXAMINE_ITEM_GROUND;
-
-                ClassifiedMenuItem item = new ClassifiedMenuItem(
-                        entry,
-                        i,
-                        normalizedItemName,
-                        normalizedOption,
-                        isPriority,
-                        itemId,
-                        0);
-
-                boolean shouldDeprioritize = false;
-                if (isPriority) {
-                    if (isExamine && !config.prioritizeExamine()) {
-                        shouldDeprioritize = true;
-                    }
-                } else {
-                    shouldDeprioritize = true;
+                ClassifiedMenuItem item = classified.get(entry);
+                if (item == null) {
+                    // Should not happen, but fall back to treating as deprioritized
+                    otherEntries.add(entry);
+                    continue;
                 }
+                boolean isExamine = action == MenuAction.EXAMINE_ITEM_GROUND;
+                boolean shouldDeprioritize = !item.isPriority()
+                        || (isExamine && !config.prioritizeExamine());
 
                 if (shouldDeprioritize) {
                     deprioritized.add(item);
@@ -567,70 +467,105 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
             }
         }
 
-        // Sort deprioritized items if prioritizeExamine is OFF
         if (!config.prioritizeExamine()) {
-            deprioritized.sort((a, b) -> Integer.compare(getDeprioritizedCategory(a), getDeprioritizedCategory(b)));
+            deprioritized.sort((a, b) -> Integer.compare(deprioritizedCategory(a), deprioritizedCategory(b)));
         }
 
-        // Reconstruct the menu entries list (bottom of menu to top)
-        List<MenuEntry> newEntriesList = new ArrayList<>();
+        List<MenuEntry> result = new ArrayList<>(entries.length);
+        cancelEntries.forEach(result::add);
+        deprioritized.forEach(item -> result.add(item.getEntry()));
+        otherEntries.forEach(result::add);
+        prioritized.forEach(item -> result.add(item.getEntry()));
 
-        // 1. Cancel entries at the very bottom (lowest index)
-        newEntriesList.addAll(cancelEntries);
-
-        // 2. Deprioritized ground items
-        for (ClassifiedMenuItem item : deprioritized) {
-            newEntriesList.add(item.getEntry());
-        }
-
-        // 3. Other entries (like Walk here, NPC options)
-        newEntriesList.addAll(otherEntries);
-
-        // 4. Prioritized ground items at the top (highest index)
-        for (ClassifiedMenuItem item : prioritized) {
-            newEntriesList.add(item.getEntry());
-        }
-
-        client.setMenuEntries(newEntriesList.toArray(new MenuEntry[0]));
-        log.info("[Menu] DEPRIORITIZE mode applied: reordered menu with {} prioritized and {} deprioritized ground items", 
-                prioritized.size(), deprioritized.size());
+        log.info("[Menu] DEPRIORITIZE: {} priority, {} deprioritized", prioritized.size(), deprioritized.size());
+        return result;
     }
 
-    private int getDeprioritizedCategory(ClassifiedMenuItem item) {
-        boolean isPriority = item.isPriority();
+    private int deprioritizedCategory(ClassifiedMenuItem item) {
         boolean isExamine = item.getEntry().getType() == MenuAction.EXAMINE_ITEM_GROUND;
+        if (item.isPriority()) return 1;   // priority Examine (deprioritized due to prioritizeExamine=false)
+        return isExamine ? 0 : 2;          // non-priority Examine (0) vs non-priority Take (2)
+    }
 
-        if (isPriority) {
-            // Must be Examine (since shouldDeprioritize was true and isPriority is true)
-            return 1; // Priority Examine
-        } else {
-            return isExamine ? 0 : 2; // Non-priority Examine (0) vs Non-priority Take (2)
+    /**
+     * Applies cosmetic modifications (priority marker and value annotation) to ground item
+     * entries that survived mode processing. Called on the final result list so that
+     * classification has already happened and targets haven't been changed yet.
+     */
+    private void applyDisplayModifications(List<MenuEntry> result, List<ClassifiedMenuItem> groundItems) {
+        boolean showMarker = config.enablePriorityMarker();
+        boolean showValue = config.showItemValueInMenu();
+        if (!showMarker && !showValue) return;
+
+        // Map entry reference → classified item for the entries still in the result
+        Map<MenuEntry, ClassifiedMenuItem> entryMap = new IdentityHashMap<>();
+        for (ClassifiedMenuItem item : groundItems) {
+            entryMap.put(item.getEntry(), item);
+        }
+
+        PriorityMarker markerStyle = config.priorityMarker();
+        boolean markerActive = showMarker && markerStyle != null && markerStyle != PriorityMarker.NONE;
+
+        for (MenuEntry entry : result) {
+            ClassifiedMenuItem item = entryMap.get(entry);
+            if (item == null) continue; // Non-ground entry
+
+            String target = entry.getTarget();
+
+            if (showValue && classifier != null) {
+                int value = classifier.getItemDisplayValue(entry);
+                if (value > 0) {
+                    target = target + " <col=aaaaaa>(" + formatValue(value) + ")</col>";
+                }
+            }
+
+            if (markerActive && item.isPriority()) {
+                target = markerStyle.getSymbol() + " " + target;
+            }
+
+            if (!target.equals(entry.getTarget())) {
+                entry.setTarget(target);
+            }
         }
     }
 
-    public String getCurrentTask() {
-        return currentTask;
+    private String formatValue(int value) {
+        if (value >= 1_000_000) {
+            double m = value / 1_000_000.0;
+            return (m == (long) m) ? (long) m + "m" : String.format("%.1fm", m);
+        }
+        if (value >= 1_000) {
+            double k = value / 1_000.0;
+            return (k == (long) k) ? (long) k + "k" : String.format("%.1fk", k);
+        }
+        return String.valueOf(value);
     }
 
-    public String getCurrentNpc() {
-        return currentNpc;
+    private boolean isGroundItemAction(MenuAction action) {
+        return action == MenuAction.GROUND_ITEM_FIRST_OPTION
+                || action == MenuAction.GROUND_ITEM_SECOND_OPTION
+                || action == MenuAction.GROUND_ITEM_THIRD_OPTION
+                || action == MenuAction.GROUND_ITEM_FOURTH_OPTION
+                || action == MenuAction.GROUND_ITEM_FIFTH_OPTION
+                || action == MenuAction.EXAMINE_ITEM_GROUND;
     }
 
-    public int getCurrentNpcId() {
-        return currentNpcId;
+    private String normalizeItemName(String itemName) {
+        itemName = net.runelite.client.util.Text.removeTags(itemName);
+        if (config.supportCollapsedItems()) {
+            itemName = itemName.replaceAll("\\s+x\\s+\\d+$", "");
+        }
+        return itemName.replaceAll("\\s*\\([^)]*\\)$", "").trim();
     }
 
-    public int getDropCount() {
-        return currentTaskDrops.size();
-    }
+    // ─── Accessors for overlay ──────────────────────────────────────────────
 
-    public String getLastWikiPage() {
-        return lastWikiPage;
-    }
-
+    public String getCurrentTask() { return currentTask; }
+    public String getCurrentNpc() { return currentNpc; }
+    public int getCurrentNpcId() { return currentNpcId; }
+    public int getDropCount() { return currentTaskDrops.size(); }
+    public String getLastWikiPage() { return lastWikiPage; }
     public boolean isInCombatGrace() {
         return (client.getTickCount() - lastCombatTick) <= config.combatTimeout();
     }
-
-    private final Map<Integer, Set<String>> dropCache = new HashMap<>();
 }

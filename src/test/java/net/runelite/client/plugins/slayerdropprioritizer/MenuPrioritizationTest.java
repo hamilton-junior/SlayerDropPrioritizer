@@ -50,6 +50,21 @@ public class MenuPrioritizationTest {
         when(config.dropDisplayMode()).thenAnswer(inv -> dropDisplayMode);
         when(config.prioritizeExamine()).thenAnswer(inv -> prioritizeExamine);
         when(config.combatTimeout()).thenAnswer(inv -> combatTimeout);
+        // New config methods - explicit stubs so enum returns are never null
+        when(config.priorityValueSource()).thenReturn(PriorityValueSource.GE_ONLY);
+        when(config.enableCluePriority()).thenReturn(false);
+        when(config.enableRarePriority()).thenReturn(false);
+        when(config.maxRareDenominator()).thenReturn(512);
+        when(config.alwaysPriorityItems()).thenReturn("");
+        when(config.alwaysIgnoreItems()).thenReturn("");
+        when(config.interestingDropsOnly()).thenReturn(false);
+        when(config.enablePriorityMarker()).thenReturn(false);
+        when(config.priorityMarker()).thenReturn(PriorityMarker.NONE);
+        when(config.showItemValueInMenu()).thenReturn(false);
+        when(config.itemValueDisplay()).thenReturn(ItemValueDisplay.GE);
+        when(config.testMode()).thenReturn(false);
+        when(config.testMonsterName()).thenReturn("Goblin");
+        when(config.supportCollapsedItems()).thenReturn(true);
 
         // Mock ItemManager to avoid null pointers
         ItemComposition mockComposition = mock(ItemComposition.class);

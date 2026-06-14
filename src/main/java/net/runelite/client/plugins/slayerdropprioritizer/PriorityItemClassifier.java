@@ -11,28 +11,58 @@ import net.runelite.api.TileItem;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.client.game.ItemManager;
 
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * Classifies menu items as priority or non-priority based on drop table and GE price.
- */
 @Slf4j
 public class PriorityItemClassifier {
     private final ItemManager itemManager;
     private final Client client;
     private final Set<String> taskDrops;
+    private final Map<String, Double> dropRarity;
     private final SlayerDropPrioritizerConfig config;
 
-    private final Map<Integer, Integer> unitPriceCache = new HashMap<>();
+    private final Map<Integer, Integer> unitGePriceCache = new HashMap<>();
+    private final Map<Integer, Integer> unitHaPriceCache = new HashMap<>();
+
+    private Set<String> alwaysPrioritySet = Collections.emptySet();
+    private Set<String> alwaysIgnoreSet = Collections.emptySet();
 
     public PriorityItemClassifier(ItemManager itemManager, Client client, Set<String> taskDrops,
-            SlayerDropPrioritizerConfig config) {
+            Map<String, Double> dropRarity, SlayerDropPrioritizerConfig config) {
         this.itemManager = itemManager;
         this.client = client;
         this.taskDrops = taskDrops;
+        this.dropRarity = dropRarity;
         this.config = config;
+        refreshCustomLists();
+    }
+
+    public PriorityItemClassifier(ItemManager itemManager, Client client, Set<String> taskDrops,
+            SlayerDropPrioritizerConfig config) {
+        this(itemManager, client, taskDrops, new HashMap<>(), config);
+    }
+
+    public void refreshCustomLists() {
+        alwaysPrioritySet = parseItemList(config.alwaysPriorityItems());
+        alwaysIgnoreSet = parseItemList(config.alwaysIgnoreItems());
+    }
+
+    private Set<String> parseItemList(String raw) {
+        if (raw == null || raw.isEmpty()) {
+            return Collections.emptySet();
+        }
+        Set<String> result = new HashSet<>();
+        for (String entry : raw.split("[,\n]")) {
+            String trimmed = entry.trim();
+            if (!trimmed.isEmpty()) {
+                result.add(trimmed.toLowerCase());
+            }
+        }
+        return result;
     }
 
     public boolean isPriority(String normalizedItemName, int itemId) {
@@ -40,26 +70,55 @@ public class PriorityItemClassifier {
     }
 
     public boolean isPriority(String normalizedItemName, int itemId, int quantity) {
-        int minPrice = config.minimumPriorityValue();
+        String lower = normalizedItemName.toLowerCase();
 
-        // Always prioritize items that meet the minimum value threshold (if configured)
+        // 1. Always-ignore list: highest priority, returns false immediately
+        if (alwaysIgnoreSet.contains(lower)) {
+            log.debug("[Classifier] Always ignore: {}", normalizedItemName);
+            return false;
+        }
+
+        // 2. Always-priority list: unconditionally priority
+        if (alwaysPrioritySet.contains(lower)) {
+            log.debug("[Classifier] Always priority: {}", normalizedItemName);
+            return true;
+        }
+
+        // 3. Clue scrolls
+        if (config.enableCluePriority() && isClueScroll(normalizedItemName)) {
+            log.debug("[Classifier] Clue scroll: {}", normalizedItemName);
+            return true;
+        }
+
+        // 4. Minimum value threshold
+        int minPrice = config.minimumPriorityValue();
         if (minPrice > 0) {
-            int price = getGePrice(itemId) * quantity;
-            if (price >= minPrice) {
-                log.debug("[Classifier] Valuable item: {} (id={}, qty={}) total_price={}",
-                        normalizedItemName, itemId, quantity, price);
+            int effectiveValue = getEffectiveValue(itemId, quantity);
+            if (effectiveValue >= minPrice) {
+                log.debug("[Classifier] Meets value threshold: {} (id={}, qty={}, value={})",
+                        normalizedItemName, itemId, quantity, effectiveValue);
                 return true;
             }
         }
 
-        // If it's a task drop, check mode
-        if (taskDrops.contains(normalizedItemName)) {
+        // 5. Task drop table check — skipped when interestingDropsOnly is enabled,
+        //    because task membership alone is not sufficient in that mode.
+        if (!config.interestingDropsOnly() && taskDrops.contains(normalizedItemName)) {
             if (config.prioritizationMode() == PrioritizationMode.ALL_TASK_DROPS) {
                 return true;
             }
-            // If VALUABLE_TASK_DROPS is selected but minPrice is 0, we can't filter by
-            // value, so we allow it.
+            // VALUABLE_TASK_DROPS with minPrice == 0: can't filter by value, allow all
             if (config.prioritizationMode() == PrioritizationMode.VALUABLE_TASK_DROPS && minPrice == 0) {
+                return true;
+            }
+            // VALUABLE_TASK_DROPS with minPrice > 0: already checked above, value was below threshold
+        }
+
+        // 6. Wiki rarity check (applies to task drops; step 5 already handled the non-interesting path)
+        if (config.enableRarePriority()) {
+            Double denominator = dropRarity.get(normalizedItemName);
+            if (denominator != null && denominator <= config.maxRareDenominator()) {
+                log.debug("[Classifier] Rare drop: {} (1/{})", normalizedItemName, denominator.intValue());
                 return true;
             }
         }
@@ -68,11 +127,36 @@ public class PriorityItemClassifier {
     }
 
     public boolean isPriority(MenuEntry entry, String normalizedItemName) {
-        int itemId = entry.getIdentifier();
-        int quantity = 1;
+        return isPriority(normalizedItemName, entry.getIdentifier(), extractQuantityFromTile(entry));
+    }
 
-        // Calculate the item quantity on the tile by searching for the TileItem
-        // matching the identifier
+    public int getItemDisplayValue(MenuEntry entry) {
+        int itemId = entry.getIdentifier();
+        int quantity = extractQuantityFromTile(entry);
+        ItemValueDisplay display = config.itemValueDisplay();
+        if (display == ItemValueDisplay.HA) {
+            return getHaPrice(itemId) * quantity;
+        }
+        return getGePrice(itemId) * quantity;
+    }
+
+    private boolean isClueScroll(String name) {
+        return name.toLowerCase().startsWith("clue scroll");
+    }
+
+    private int getEffectiveValue(int itemId, int quantity) {
+        PriorityValueSource source = config.priorityValueSource();
+        if (source == PriorityValueSource.HA_ONLY) {
+            return getHaPrice(itemId) * quantity;
+        }
+        if (source == PriorityValueSource.HIGHEST_OF_BOTH) {
+            return Math.max(getGePrice(itemId), getHaPrice(itemId)) * quantity;
+        }
+        return getGePrice(itemId) * quantity; // GE_ONLY or null-safe default
+    }
+
+    private int extractQuantityFromTile(MenuEntry entry) {
+        int itemId = entry.getIdentifier();
         int sceneX = entry.getParam0();
         int sceneY = entry.getParam1();
 
@@ -85,10 +169,9 @@ public class PriorityItemClassifier {
                     if (itemLayer != null) {
                         Node current = itemLayer.getBottom();
                         while (current instanceof TileItem) {
-                            TileItem item = (TileItem) current;
-                            if (item.getId() == itemId) {
-                                quantity = item.getQuantity();
-                                break;
+                            TileItem tileItem = (TileItem) current;
+                            if (tileItem.getId() == itemId) {
+                                return tileItem.getQuantity();
                             }
                             current = current.getNext();
                         }
@@ -96,30 +179,31 @@ public class PriorityItemClassifier {
                 }
             }
         }
-
-        return isPriority(normalizedItemName, itemId, quantity);
+        return 1;
     }
 
-    /**
-     * Gets the unit price from cache, resolving noted items and coins.
-     */
     private int getGePrice(int itemId) {
-        return unitPriceCache.computeIfAbsent(itemId, id -> {
-            ItemComposition itemComposition = itemManager.getItemComposition(id);
-            int realItemId = itemComposition.getNote() != -1 ? itemComposition.getLinkedNoteId() : id;
+        return unitGePriceCache.computeIfAbsent(itemId, id -> {
+            ItemComposition comp = itemManager.getItemComposition(id);
+            int realId = comp.getNote() != -1 ? comp.getLinkedNoteId() : id;
+            int price = (realId == ItemID.COINS) ? 1 : itemManager.getItemPrice(realId);
+            log.debug("[Price] GE id={} realId={} price={}", id, realId, price);
+            return price;
+        });
+    }
 
-            int price;
-            if (realItemId == ItemID.COINS) {
-                price = 1;
-            } else {
-                price = itemManager.getItemPrice(realItemId);
-            }
-            log.debug("[Price Cache] Cached item {} (realId={}) unit price = {}", id, realItemId, price);
+    private int getHaPrice(int itemId) {
+        return unitHaPriceCache.computeIfAbsent(itemId, id -> {
+            ItemComposition comp = itemManager.getItemComposition(id);
+            int realId = comp.getNote() != -1 ? comp.getLinkedNoteId() : id;
+            int price = (realId == ItemID.COINS) ? 1 : itemManager.getItemComposition(realId).getHaPrice();
+            log.debug("[Price] HA id={} realId={} price={}", id, realId, price);
             return price;
         });
     }
 
     public void clearCache() {
-        unitPriceCache.clear();
+        unitGePriceCache.clear();
+        unitHaPriceCache.clear();
     }
 }
