@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Actor;
+import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
@@ -113,14 +114,26 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
     private static final String CONFIG_GROUP = "slayerdropprioritizer";
     private static final long CACHE_TTL_MS = 7L * 24 * 60 * 60 * 1000; // 7 days
     private static final File CACHE_DIR = new File(RuneLite.RUNELITE_DIR, "slayer-drop-prioritizer");
+    // OSRS Wiki etiquette: identify the client with a descriptive User-Agent.
+    private static final String USER_AGENT = "RuneLite-SlayerDropPrioritizer/1.0";
 
-    private static final Pattern DROPS_LINE_NAME_PATTERN =
-            Pattern.compile("\\b[Nn]ame\\s*=\\s*([^|\n}]+)");
-    private static final Pattern DROPS_LINE_RARITY_PATTERN =
-            Pattern.compile("\\b[Rr]arity\\s*=\\s*([^|\n}]+)");
     // Captures numerator and denominator (both may be decimal), e.g. "3/128" or "1/5000".
     private static final Pattern RARITY_FRACTION_PATTERN =
             Pattern.compile("(\\d+(?:\\.\\d+)?)\\s*/\\s*(\\d+(?:\\.\\d+)?)");
+    // Leading <img=N> tag, e.g. the placeholder prepended by the Ground Loot Icons plugin.
+    private static final Pattern LEADING_IMG_PATTERN = Pattern.compile("^<img=\\d+>");
+
+    // Rendered drop-table parsing (prop=text HTML). Using the rendered page expands macro
+    // templates like {{HerbDropLines}}, {{RareDropTable}}, {{GemDropTable}} into real rows,
+    // which raw {{DropsLine}} wikitext parsing missed (e.g. herbs were absent).
+    private static final Pattern DROP_TABLE_PATTERN =
+            Pattern.compile("(?s)<table\\b[^>]*\\bitem-drops\\b[^>]*>(.*?)</table>");
+    private static final Pattern TABLE_ROW_PATTERN =
+            Pattern.compile("(?s)<tr\\b[^>]*>(.*?)</tr>");
+    private static final Pattern LINK_TITLE_PATTERN =
+            Pattern.compile("title=\"([^\"]+)\"");
+    private static final Pattern HTML_TAG_PATTERN =
+            Pattern.compile("<[^>]+>");
 
     @Provides
     SlayerDropPrioritizerConfig provideConfig(ConfigManager configManager) {
@@ -135,6 +148,8 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
         active = true;
         migrateConfig();
         migrateRarityConfig();
+        migratePrioritizationMode();
+        migratePriorityMarker();
         classifier = new PriorityItemClassifier(itemManager, client, currentTaskDrops, currentDropRarity, config);
         syncOverlay();
         checkTask();
@@ -185,6 +200,45 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
             }
         }
         configManager.unsetConfiguration(CONFIG_GROUP, "maxRareDenominator");
+    }
+
+    /**
+     * Migrates the removed "prioritizationMode" key. The old VALUABLE_TASK_DROPS mode is
+     * equivalent to enabling "Interesting Drops Only"; ALL_TASK_DROPS is the default behavior.
+     */
+    private void migratePrioritizationMode() {
+        String oldValue = configManager.getConfiguration(CONFIG_GROUP, "prioritizationMode");
+        if (oldValue == null) {
+            return;
+        }
+        if ("VALUABLE_TASK_DROPS".equals(oldValue.trim())
+                && configManager.getConfiguration(CONFIG_GROUP, "interestingDropsOnly") == null) {
+            configManager.setConfiguration(CONFIG_GROUP, "interestingDropsOnly", true);
+            log.info("[Migration] prioritizationMode=VALUABLE_TASK_DROPS -> interestingDropsOnly=true");
+        }
+        configManager.unsetConfiguration(CONFIG_GROUP, "prioritizationMode");
+    }
+
+    /** Migrates the removed "priorityMarker" enum key to the free-text "markerText" key. */
+    private void migratePriorityMarker() {
+        String oldValue = configManager.getConfiguration(CONFIG_GROUP, "priorityMarker");
+        if (oldValue == null) {
+            return;
+        }
+        if (configManager.getConfiguration(CONFIG_GROUP, "markerText") == null) {
+            String symbol;
+            switch (oldValue.trim()) {
+                case "ARROW": symbol = ">"; break;
+                case "PLUS": symbol = "+"; break;
+                case "DASH": symbol = "-"; break;
+                case "NONE": symbol = ""; break;
+                case "STAR":
+                default: symbol = "*"; break;
+            }
+            configManager.setConfiguration(CONFIG_GROUP, "markerText", symbol);
+            log.info("[Migration] priorityMarker={} -> markerText='{}'", oldValue, symbol);
+        }
+        configManager.unsetConfiguration(CONFIG_GROUP, "priorityMarker");
     }
 
     /** Adds or removes the debug overlay to match the showDebugOverlay config. */
@@ -243,13 +297,50 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
     @Subscribe
     public void onConfigChanged(ConfigChanged event) {
-        if (CONFIG_GROUP.equals(event.getGroup())) {
-            if (classifier != null) {
-                classifier.refreshCustomLists();
-            }
-            syncOverlay();
-            checkTask();
+        if (!CONFIG_GROUP.equals(event.getGroup())) {
+            return;
         }
+
+        // "Clear Cache & Refresh" acts as a button: it resets itself after running.
+        if ("clearCacheNow".equals(event.getKey()) && config.clearCacheNow()) {
+            clearCaches();
+            configManager.setConfiguration(CONFIG_GROUP, "clearCacheNow", false);
+            return;
+        }
+
+        if (classifier != null) {
+            classifier.refreshCustomLists();
+        }
+        syncOverlay();
+        checkTask();
+    }
+
+    /**
+     * Clears in-memory and on-disk drop caches and forces the current task to re-resolve.
+     * Disk deletion runs off the client thread.
+     */
+    private void clearCaches() {
+        dropCache.clear();
+        dropRarityCache.clear();
+        resolvedNpcIds.clear();
+        currentTaskDrops.clear();
+        currentDropRarity.clear();
+        currentTask = "";
+
+        executor.execute(() -> {
+            File[] files = CACHE_DIR.listFiles((dir, fileName) -> fileName.endsWith(".json"));
+            if (files != null) {
+                for (File file : files) {
+                    if (!file.delete()) {
+                        log.debug("[Cache] Could not delete {}", file);
+                    }
+                }
+            }
+            log.info("[Cache] Cleared drop table cache");
+        });
+
+        // Re-resolve the active task on the client thread.
+        clientThread.invoke(this::checkTask);
     }
 
     @Subscribe
@@ -330,7 +421,7 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                 .addQueryParameter("id", String.valueOf(npcId))
                 .build();
 
-        Request request = new Request.Builder().url(url).build();
+        Request request = new Request.Builder().url(url).header("User-Agent", USER_AGENT).build();
         okHttpClient.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
@@ -368,10 +459,10 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                 .addQueryParameter("action", "parse")
                 .addQueryParameter("page", page)
                 .addQueryParameter("format", "json")
-                .addQueryParameter("prop", "wikitext")
+                .addQueryParameter("prop", "text")
                 .build();
 
-        Request request = new Request.Builder().url(url).build();
+        Request request = new Request.Builder().url(url).header("User-Agent", USER_AGENT).build();
         okHttpClient.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
@@ -393,12 +484,12 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                         return;
                     }
                     JsonObject parse = jsonObject.getAsJsonObject("parse");
-                    if (parse == null || !parse.has("wikitext")) return;
-                    JsonObject wikitext = parse.getAsJsonObject("wikitext");
-                    if (wikitext == null || !wikitext.has("*")) return;
+                    if (parse == null || !parse.has("text")) return;
+                    JsonObject text = parse.getAsJsonObject("text");
+                    if (text == null || !text.has("*")) return;
 
-                    String wikiText = wikitext.get("*").getAsString();
-                    parseDropsFromWikiText(wikiText, npcId);
+                    String html = text.get("*").getAsString();
+                    parseDropsFromHtml(html, npcId);
                 } finally {
                     response.close();
                 }
@@ -407,37 +498,41 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
     }
 
     /**
-     * Parses the Name/Rarity of each {{DropsLine}} block, then persists and applies the result.
-     * Rarity is stored as the effective denominator (a "3/128" drop becomes ~42.67).
+     * Parses item name + rarity from the rendered drop tables (HTML). Operating on the rendered
+     * page expands macro templates ({{HerbDropLines}}, {{RareDropTable}}, {{GemDropTable}}, …)
+     * into real rows, so herbs and similar drops are captured. Rarity is stored as the effective
+     * denominator (a "3/128" drop becomes ~42.67).
      */
-    private void parseDropsFromWikiText(String wikiText, int npcId) {
+    private void parseDropsFromHtml(String html, int npcId) {
         Set<String> drops = new HashSet<>();
         Map<String, Double> rarityMap = new HashMap<>();
 
-        // Split on each DropsLine template start; index 0 is text before the first one
-        String[] blocks = wikiText.split("\\{\\{\\s*DropsLine");
-        for (int i = 1; i < blocks.length; i++) {
-            String block = blocks[i];
-            int end = block.indexOf("}}");
-            if (end < 0) continue;
-            String templateBody = block.substring(0, end);
+        Matcher tableMatcher = DROP_TABLE_PATTERN.matcher(html);
+        while (tableMatcher.find()) {
+            Matcher rowMatcher = TABLE_ROW_PATTERN.matcher(tableMatcher.group(1));
+            while (rowMatcher.find()) {
+                String row = rowMatcher.group(1);
 
-            Matcher nameMatcher = DROPS_LINE_NAME_PATTERN.matcher(templateBody);
-            if (!nameMatcher.find()) continue;
-            String itemName = nameMatcher.group(1).trim();
-            drops.add(itemName);
+                // Item name = the title attribute of the first item link in the row.
+                Matcher titleMatcher = LINK_TITLE_PATTERN.matcher(row);
+                if (!titleMatcher.find()) {
+                    continue; // header / separator row
+                }
+                String itemName = decodeHtml(titleMatcher.group(1)).trim();
+                if (itemName.isEmpty()) {
+                    continue;
+                }
+                drops.add(itemName);
 
-            Matcher rarityMatcher = DROPS_LINE_RARITY_PATTERN.matcher(templateBody);
-            if (rarityMatcher.find()) {
-                String rarityText = rarityMatcher.group(1).trim().replace(",", "");
-                Matcher fractionMatcher = RARITY_FRACTION_PATTERN.matcher(rarityText);
+                // Rarity = the only "N/M" fraction in the row's visible text (quantity and
+                // price columns never contain a slash).
+                String rowText = HTML_TAG_PATTERN.matcher(row).replaceAll(" ").replace(",", "");
+                Matcher fractionMatcher = RARITY_FRACTION_PATTERN.matcher(rowText);
                 if (fractionMatcher.find()) {
                     double numerator = Double.parseDouble(fractionMatcher.group(1));
                     double denominator = Double.parseDouble(fractionMatcher.group(2));
                     if (numerator > 0) {
-                        double effective = denominator / numerator;
-                        rarityMap.put(itemName, effective);
-                        log.debug("[Wiki] Rarity for {}: 1/{}", itemName, effective);
+                        rarityMap.put(itemName, denominator / numerator);
                     }
                 }
             }
@@ -445,6 +540,18 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
         log.info("[Wiki] Loaded {} drops ({} with rarity) for NPC id={}", drops.size(), rarityMap.size(), npcId);
         applyDrops(npcId, drops, rarityMap, true);
+    }
+
+    /** Decodes the handful of HTML entities that appear in OSRS Wiki item names. */
+    private static String decodeHtml(String s) {
+        return s.replace("&amp;", "&")
+                .replace("&#39;", "'")
+                .replace("&#039;", "'")
+                .replace("&quot;", "\"")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&nbsp;", " ")
+                .replace("&#160;", " ");
     }
 
     /**
@@ -492,6 +599,7 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
     private boolean isFresh(CachedDropTable cached) {
         return cached != null
+                && cached.version == CachedDropTable.CURRENT_VERSION
                 && cached.drops != null
                 && !cached.drops.isEmpty()
                 && (System.currentTimeMillis() - cached.timestamp) < CACHE_TTL_MS;
@@ -507,7 +615,8 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
                 return;
             }
             CachedDropTable table = new CachedDropTable(
-                    System.currentTimeMillis(), new HashSet<>(drops), new HashMap<>(rarities));
+                    CachedDropTable.CURRENT_VERSION, System.currentTimeMillis(),
+                    new HashSet<>(drops), new HashMap<>(rarities));
             File file = new File(CACHE_DIR, npcId + ".json");
             try (Writer writer = new FileWriter(file)) {
                 gson.toJson(table, writer);
@@ -533,9 +642,39 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
         int quantity = item.getQuantity();
         String name = normalizeItemName(itemManager.getItemComposition(itemId).getName());
 
-        if (isPriorityDrop(name, itemId, quantity)) {
-            notifier.notify("Slayer priority drop: " + name);
-            log.debug("[Notify] Priority drop spawned: {} (id={}, qty={})", name, itemId, quantity);
+        if (!isPriorityDrop(name, itemId, quantity)) {
+            return;
+        }
+
+        RarityTier tier = rarityTierFor(name);
+        if (!meetsNotifyTier(tier)) {
+            return;
+        }
+
+        notifier.notify(notificationMessage(tier, name));
+        log.debug("[Notify] Priority drop spawned: {} (id={}, qty={}, tier={})", name, itemId, quantity, tier);
+    }
+
+    private boolean meetsNotifyTier(RarityTier tier) {
+        switch (config.notifyMinTier()) {
+            case ULTRA_RARE:
+                return tier == RarityTier.ULTRA_RARE;
+            case RARE:
+                return tier == RarityTier.RARE || tier == RarityTier.ULTRA_RARE;
+            case ALL_PRIORITY:
+            default:
+                return true;
+        }
+    }
+
+    private String notificationMessage(RarityTier tier, String name) {
+        switch (tier) {
+            case ULTRA_RARE:
+                return "Ultra-rare Slayer drop: " + name;
+            case RARE:
+                return "Rare Slayer drop: " + name;
+            default:
+                return "Slayer priority drop: " + name;
         }
     }
 
@@ -571,24 +710,136 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
         log.info("[Menu] Opened with {} ground items (mode={})", groundItems.size(), config.dropDisplayMode());
 
-        List<MenuEntry> result;
         DropDisplayMode mode = config.dropDisplayMode();
+        boolean decorate = config.enablePriorityMarker() || config.showItemValueInMenu()
+                || config.highlightTaskItems() || config.showRarityInMenu();
 
         if (mode == DropDisplayMode.HIDE || mode == DropDisplayMode.HIDE_TAKE_ONLY) {
-            result = buildHideModeEntries(entries, groundItems, mode == DropDisplayMode.HIDE_TAKE_ONLY);
+            List<MenuEntry> result = buildHideModeEntries(entries, groundItems, mode == DropDisplayMode.HIDE_TAKE_ONLY);
+            applyDisplayModifications(result, groundItems);
+            client.setMenuEntries(result.toArray(new MenuEntry[0]));
         } else if (mode == DropDisplayMode.DEPRIORITIZE) {
-            result = buildDeprioritizeModeEntries(entries, groundItems);
-        } else {
-            // SHOW mode: no reordering, but still apply visual decorations if configured
-            if (!config.enablePriorityMarker() && !config.showItemValueInMenu() && !config.highlightTaskItems()) {
-                log.debug("[Menu] SHOW mode - no changes");
-                return;
-            }
-            result = new ArrayList<>(Arrays.asList(entries));
+            List<MenuEntry> result = buildDeprioritizeModeEntries(entries, groundItems);
+            applyDisplayModifications(result, groundItems);
+            client.setMenuEntries(result.toArray(new MenuEntry[0]));
+        } else if (decorate) {
+            // SHOW mode with cosmetic decorations only
+            List<MenuEntry> result = new ArrayList<>(Arrays.asList(entries));
+            applyDisplayModifications(result, groundItems);
+            client.setMenuEntries(result.toArray(new MenuEntry[0]));
         }
 
-        applyDisplayModifications(result, groundItems);
-        client.setMenuEntries(result.toArray(new MenuEntry[0]));
+        // Management entries operate on the (possibly rebuilt) live menu, in every mode.
+        if (config.addManageMenuEntries()) {
+            addManagementEntries(groundItems);
+        }
+    }
+
+    /**
+     * Adds local-only "Prioritize"/"Ignore" right-click options for each unique ground item,
+     * toggling the item in the Always Priority / Always Ignore config lists. These are
+     * {@link MenuAction#RUNELITE} entries with an onClick handler — they never hit the server.
+     * Inserted near the bottom of the menu so they never become the default left-click action.
+     */
+    private void addManagementEntries(List<ClassifiedMenuItem> groundItems) {
+        Set<String> seen = new HashSet<>();
+        for (ClassifiedMenuItem item : groundItems) {
+            String name = item.getNormalizedItemName();
+            if (name.isEmpty() || !seen.add(name.toLowerCase())) {
+                continue;
+            }
+
+            boolean inPriority = listContains(configManager.getConfiguration(CONFIG_GROUP, "alwaysPriorityItems"), name);
+            boolean inIgnore = listContains(configManager.getConfiguration(CONFIG_GROUP, "alwaysIgnoreItems"), name);
+            String coloredName = "<col=ff9040>" + name + "</col>";
+
+            client.createMenuEntry(1)
+                    .setOption(inIgnore ? "Unignore" : "Ignore")
+                    .setTarget(coloredName)
+                    .setType(MenuAction.RUNELITE)
+                    .onClick(e -> setListMembership("alwaysIgnoreItems", "alwaysPriorityItems", name));
+
+            client.createMenuEntry(1)
+                    .setOption(inPriority ? "Unprioritize" : "Prioritize")
+                    .setTarget(coloredName)
+                    .setType(MenuAction.RUNELITE)
+                    .onClick(e -> setListMembership("alwaysPriorityItems", "alwaysIgnoreItems", name));
+        }
+    }
+
+    private boolean listContains(String value, String itemName) {
+        if (value == null || value.isEmpty()) {
+            return false;
+        }
+        for (String token : value.split("[,\\r\\n]+")) {
+            if (token.trim().equalsIgnoreCase(itemName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Toggles an item in {@code targetKey}. When adding it, it is also removed from
+     * {@code exclusiveKey} so an item is never both prioritized and ignored at once.
+     */
+    private void setListMembership(String targetKey, String exclusiveKey, String itemName) {
+        String listLabel = "alwaysPriorityItems".equals(targetKey) ? "priority" : "ignore";
+        boolean alreadyThere = listContains(configManager.getConfiguration(CONFIG_GROUP, targetKey), itemName);
+        if (alreadyThere) {
+            removeFromList(targetKey, itemName);
+            log.debug("[Manage] Removed '{}' from {}", itemName, targetKey);
+            sendManageFeedback("Removed " + itemName + " from the " + listLabel + " list.");
+        } else {
+            addToList(targetKey, itemName);
+            removeFromList(exclusiveKey, itemName);
+            log.debug("[Manage] Added '{}' to {} (removed from {})", itemName, targetKey, exclusiveKey);
+            sendManageFeedback("Added " + itemName + " to the " + listLabel + " list.");
+        }
+    }
+
+    /** Confirms a list change in the game chat (the config panel does not refresh live). */
+    private void sendManageFeedback(String message) {
+        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
+                "[Slayer Drop Prioritizer] " + message, null);
+    }
+
+    private void addToList(String configKey, String itemName) {
+        String current = configManager.getConfiguration(CONFIG_GROUP, configKey);
+        if (listContains(current, itemName)) {
+            return;
+        }
+        List<String> lines = splitList(current);
+        lines.add(itemName);
+        configManager.setConfiguration(CONFIG_GROUP, configKey, String.join("\n", lines));
+    }
+
+    private void removeFromList(String configKey, String itemName) {
+        String current = configManager.getConfiguration(CONFIG_GROUP, configKey);
+        if (current == null || current.isEmpty()) {
+            return;
+        }
+        List<String> lines = new ArrayList<>();
+        for (String token : splitList(current)) {
+            if (!token.equalsIgnoreCase(itemName)) {
+                lines.add(token);
+            }
+        }
+        configManager.setConfiguration(CONFIG_GROUP, configKey, String.join("\n", lines));
+    }
+
+    private List<String> splitList(String raw) {
+        List<String> lines = new ArrayList<>();
+        if (raw == null) {
+            return lines;
+        }
+        for (String token : raw.split("[,\\r\\n]+")) {
+            String trimmed = token.trim();
+            if (!trimmed.isEmpty()) {
+                lines.add(trimmed);
+            }
+        }
+        return lines;
     }
 
     private List<ClassifiedMenuItem> extractAndClassifyGroundItems(MenuEntry[] entries) {
@@ -763,7 +1014,8 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
         boolean showMarker = config.enablePriorityMarker();
         boolean showValue = config.showItemValueInMenu();
         boolean highlight = config.highlightTaskItems();
-        if (!showMarker && !showValue && !highlight) return;
+        boolean showRarity = config.showRarityInMenu();
+        if (!showMarker && !showValue && !highlight && !showRarity) return;
 
         // Map entry reference → classified item for the entries still in the result
         Map<MenuEntry, ClassifiedMenuItem> entryMap = new IdentityHashMap<>();
@@ -771,36 +1023,78 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
             entryMap.put(item.getEntry(), item);
         }
 
-        PriorityMarker markerStyle = config.priorityMarker();
-        boolean markerActive = showMarker && markerStyle != null && markerStyle != PriorityMarker.NONE;
+        String markerText = config.markerText() == null ? "" : config.markerText().trim();
+        boolean markerActive = showMarker && !markerText.isEmpty();
+        String markerRendered = config.colorMarker()
+                ? "<col=" + colorToHex(config.markerColor()) + ">" + markerText + "</col>"
+                : markerText;
 
         for (MenuEntry entry : result) {
             ClassifiedMenuItem item = entryMap.get(entry);
             if (item == null) continue; // Non-ground entry
 
             boolean priority = effectivePriority(item);
-            String target = entry.getTarget();
+            String fullTarget = entry.getTarget();
 
-            // 1. Highlight the item name (recolor existing colour tags) for priority items
-            if (highlight && priority && passesHighlightValueGate(entry)) {
-                target = recolor(target, highlightHexFor(entry, item));
+            // Detach a leading Ground Loot Icons image tag so it always stays at the very
+            // front of the target. Its overlay draws the icon at a fixed X (the option width),
+            // so the placeholder must remain first; our marker goes right after it.
+            String imgPrefix = "";
+            String target = fullTarget;
+            Matcher imgMatcher = LEADING_IMG_PATTERN.matcher(fullTarget);
+            if (imgMatcher.find()) {
+                imgPrefix = fullTarget.substring(0, imgMatcher.end());
+                target = fullTarget.substring(imgMatcher.end());
             }
 
-            // 2. Append value annotation
-            if (showValue && classifier != null) {
-                int value = classifier.getItemDisplayValue(entry);
-                if (value > 0) {
-                    target = target + " <col=aaaaaa>(" + formatValue(value) + ")</col>";
+            boolean isExamine = entry.getType() == MenuAction.EXAMINE_ITEM_GROUND;
+            int displayValue = (showValue || showRarity) && classifier != null
+                    ? classifier.getItemDisplayValue(entry) : 0;
+
+            // 1. Highlight (recolor the name and/or the option) for priority items.
+            //    Examine entries are only colored when "Highlight Examine" is enabled.
+            if (highlight && priority && (!isExamine || config.highlightExamine())
+                    && passesHighlightValueGate(entry)) {
+                String hex = highlightHexFor(entry, item);
+                HighlightPart part = config.highlightPart();
+                if (part != HighlightPart.OPTION) {
+                    target = recolor(target, hex);
+                }
+                if (part != HighlightPart.NAME) {
+                    String newOption = recolor(entry.getOption(), hex);
+                    if (!newOption.equals(entry.getOption())) {
+                        entry.setOption(newOption);
+                    }
                 }
             }
 
-            // 3. Prepend the priority marker symbol
-            if (markerActive && priority) {
-                target = markerStyle.getSymbol() + " " + target;
+            // 2. Append value annotation (with gp unit)
+            if (showValue && displayValue > 0) {
+                String hex = config.useGroundItemsColors()
+                        ? colorToHex(groundItemsColorForValue(displayValue))
+                        : colorToHex(config.valueColor());
+                target = target + " <col=" + hex + ">(" + formatValue(displayValue) + " gp)</col>";
             }
 
-            if (!target.equals(entry.getTarget())) {
-                entry.setTarget(target);
+            // 3. Append rarity annotation (task drops with a known Wiki drop rate)
+            if (showRarity) {
+                Double denominator = currentDropRarity.get(item.getNormalizedItemName());
+                if (denominator != null) {
+                    String hex = config.useGroundItemsColors()
+                            ? colorToHex(groundItemsColorForValue(displayValue))
+                            : colorToHex(config.rarityColor());
+                    target = target + " <col=" + hex + ">(1/" + Math.round(denominator) + ")</col>";
+                }
+            }
+
+            // 4. Prepend the priority marker (after the icon placeholder, before the name)
+            if (markerActive && priority) {
+                target = markerRendered + " " + target;
+            }
+
+            String newTarget = imgPrefix + target;
+            if (!newTarget.equals(fullTarget)) {
+                entry.setTarget(newTarget);
             }
         }
     }
@@ -871,6 +1165,47 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
         return String.format("%02x%02x%02x", c.getRed(), c.getGreen(), c.getBlue());
     }
 
+    // ─── Ground Items color integration ─────────────────────────────────────
+
+    /**
+     * Returns the color the official Ground Items plugin would use for an item of this value,
+     * reading that plugin's configured value-tier colors/thresholds (with RuneLite's defaults
+     * as a fallback if it is not installed/configured).
+     */
+    private Color groundItemsColorForValue(int value) {
+        if (value >= groundItemsPrice("insaneValuePrice", 10_000_000)) {
+            return groundItemsColor("insaneValueColor", 0xFF66B2);
+        }
+        if (value >= groundItemsPrice("highValuePrice", 1_000_000)) {
+            return groundItemsColor("highValueColor", 0xFF9600);
+        }
+        if (value >= groundItemsPrice("mediumValuePrice", 100_000)) {
+            return groundItemsColor("mediumValueColor", 0x99FF99);
+        }
+        if (value >= groundItemsPrice("lowValuePrice", 20_000)) {
+            return groundItemsColor("lowValueColor", 0x66B2FF);
+        }
+        return groundItemsColor("defaultColor", 0xFFFFFF);
+    }
+
+    private Color groundItemsColor(String key, int fallbackRgb) {
+        try {
+            Color c = configManager.getConfiguration("grounditems", key, Color.class);
+            return c != null ? c : new Color(fallbackRgb);
+        } catch (Exception e) {
+            return new Color(fallbackRgb);
+        }
+    }
+
+    private int groundItemsPrice(String key, int fallback) {
+        try {
+            Integer v = configManager.getConfiguration("grounditems", key, Integer.class);
+            return v != null ? v : fallback;
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
     private String formatValue(int value) {
         if (value >= 1_000_000) {
             double m = value / 1_000_000.0;
@@ -894,10 +1229,18 @@ public class SlayerDropPrioritizerPlugin extends Plugin {
 
     private String normalizeItemName(String itemName) {
         itemName = net.runelite.client.util.Text.removeTags(itemName);
+        // Strip "(noted)" qualifier (does not change the underlying item identity).
+        itemName = itemName.replaceAll("\\s*\\(noted\\)$", "");
         if (config.supportCollapsedItems()) {
+            // Remove Ground Items decorations appended to the name: the collapsed-count
+            // form " x 19" and a trailing numeric quantity/value in parentheses such as
+            // " (19)" or " (1.9K)". Parentheses that are part of the real item name —
+            // e.g. "Sawmill coupon (oak plank)", "Clue scroll (hard)", potion doses
+            // like "(4)" (which have no leading space) — are intentionally preserved.
             itemName = itemName.replaceAll("\\s+x\\s+\\d+$", "");
+            itemName = itemName.replaceAll("\\s+\\(\\d[\\d,.]*[kKmMbB]?\\)$", "");
         }
-        return itemName.replaceAll("\\s*\\([^)]*\\)$", "").trim();
+        return itemName.trim();
     }
 
     // ─── Accessors for overlay ──────────────────────────────────────────────

@@ -55,60 +55,57 @@ public class PriorityItemClassifierTest {
     }
 
     @Test
-    public void testAllTaskDropsMode_taskDropPrioritized() {
-        config.setPrioritizationMode(PrioritizationMode.ALL_TASK_DROPS);
+    public void testTaskDrop_prioritizedByDefault() {
+        // interestingDropsOnly = false (default): any task drop is priority
         taskDrops.add("bones");
 
         assertTrue(classifier.isPriority("bones", 526));
     }
 
     @Test
-    public void testAllTaskDropsMode_nonTaskDropNotPrioritized() {
-        config.setPrioritizationMode(PrioritizationMode.ALL_TASK_DROPS);
+    public void testNonTaskDrop_notPrioritized() {
         taskDrops.add("bones");
 
         assertFalse(classifier.isPriority("goblin mail", 12345));
     }
 
     @Test
-    public void testValuableTaskDropsMode_valuableTaskDropPrioritized() {
-        config.setPrioritizationMode(PrioritizationMode.VALUABLE_TASK_DROPS);
+    public void testInterestingOnly_valuableTaskDropPrioritized() {
+        config.setInterestingDropsOnly(true);
         config.setMinimumPriorityValue(1000);
         taskDrops.add("adamant scimitar");
-        
+
         fakePrices.put(23456, 1200);
 
         assertTrue(classifier.isPriority("adamant scimitar", 23456));
     }
 
     @Test
-    public void testValuableTaskDropsMode_nonValuableTaskDropNotPrioritized() {
-        config.setPrioritizationMode(PrioritizationMode.VALUABLE_TASK_DROPS);
+    public void testInterestingOnly_nonValuableTaskDropNotPrioritized() {
+        config.setInterestingDropsOnly(true);
         config.setMinimumPriorityValue(1000);
         taskDrops.add("bones");
-        
+
         fakePrices.put(526, 10);
 
         assertFalse(classifier.isPriority("bones", 526));
     }
 
     @Test
-    public void testValuableTaskDropsMode_valuableNonTaskDropPrioritized() {
-        config.setPrioritizationMode(PrioritizationMode.VALUABLE_TASK_DROPS);
+    public void testValuableNonTaskDrop_prioritized() {
         config.setMinimumPriorityValue(1000);
         taskDrops.add("bones"); // "rune scimitar" is NOT in task drops
-        
+
         fakePrices.put(1333, 15000);
 
         assertTrue(classifier.isPriority("rune scimitar", 1333));
     }
 
     @Test
-    public void testValuableTaskDropsMode_nonValuableNonTaskDropNotPrioritized() {
-        config.setPrioritizationMode(PrioritizationMode.VALUABLE_TASK_DROPS);
+    public void testNonValuableNonTaskDrop_notPrioritized() {
         config.setMinimumPriorityValue(1000);
         taskDrops.add("bones"); // "goblin mail" is NOT in task drops
-        
+
         fakePrices.put(12345, 50);
 
         assertFalse(classifier.isPriority("goblin mail", 12345));
@@ -116,9 +113,8 @@ public class PriorityItemClassifierTest {
 
     @Test
     public void testPriceCaching() {
-        config.setPrioritizationMode(PrioritizationMode.VALUABLE_TASK_DROPS);
         config.setMinimumPriorityValue(1000);
-        
+
         fakePrices.put(999, 2000);
 
         // Perform multiple checks
@@ -132,9 +128,8 @@ public class PriorityItemClassifierTest {
 
     @Test
     public void testClearCache() {
-        config.setPrioritizationMode(PrioritizationMode.VALUABLE_TASK_DROPS);
         config.setMinimumPriorityValue(1000);
-        
+
         fakePrices.put(999, 2000);
 
         assertTrue(classifier.isPriority("rare item", 999));
@@ -147,7 +142,7 @@ public class PriorityItemClassifierTest {
 
     private static class FakeConfig implements SlayerDropPrioritizerConfig {
         private boolean enableDeprioritization = true;
-        private PrioritizationMode prioritizationMode = PrioritizationMode.ALL_TASK_DROPS;
+        private boolean interestingDropsOnly = false;
         private int minimumPriorityValue = 0;
         private DropDisplayMode dropDisplayMode = DropDisplayMode.DEPRIORITIZE;
         private boolean prioritizeExamine = true;
@@ -162,8 +157,8 @@ public class PriorityItemClassifierTest {
         }
 
         @Override
-        public PrioritizationMode prioritizationMode() {
-            return prioritizationMode;
+        public boolean interestingDropsOnly() {
+            return interestingDropsOnly;
         }
 
         @Override
@@ -201,8 +196,8 @@ public class PriorityItemClassifierTest {
             return supportCollapsedItems;
         }
 
-        public void setPrioritizationMode(PrioritizationMode mode) {
-            this.prioritizationMode = mode;
+        public void setInterestingDropsOnly(boolean value) {
+            this.interestingDropsOnly = value;
         }
 
         public void setMinimumPriorityValue(int value) {

@@ -11,6 +11,10 @@ import java.util.Set;
  * Wiki rarity of "3/128" is stored as ~42.67 rather than 128.
  */
 class CachedDropTable {
+    /** Bumped whenever the parsing logic changes so older caches are discarded. */
+    static final int CURRENT_VERSION = 2;
+
+    int version;
     long timestamp;
     Set<String> drops;
     Map<String, Double> rarities;
@@ -18,7 +22,8 @@ class CachedDropTable {
     CachedDropTable() {
     }
 
-    CachedDropTable(long timestamp, Set<String> drops, Map<String, Double> rarities) {
+    CachedDropTable(int version, long timestamp, Set<String> drops, Map<String, Double> rarities) {
+        this.version = version;
         this.timestamp = timestamp;
         this.drops = drops;
         this.rarities = rarities;

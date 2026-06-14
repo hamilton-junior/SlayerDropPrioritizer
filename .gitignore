@@ -1,5 +1,7 @@
 .gradle
-build
+build/
+bin/
+out/
 .idea/
 .project
 .settings/
@@ -7,5 +9,4 @@ build
 nbactions.xml
 nb-configuration.xml
 nbproject/
-build.gradle
-bin/main/net/runelite/client/plugins/slayerdropprioritizer/*.class
+.claude/settings.json

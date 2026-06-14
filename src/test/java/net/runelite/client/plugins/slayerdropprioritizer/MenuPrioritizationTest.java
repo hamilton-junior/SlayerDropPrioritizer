@@ -30,7 +30,6 @@ public class MenuPrioritizationTest {
     private SlayerDropPrioritizerPlugin plugin;
 
     private boolean enableDeprioritization = true;
-    private PrioritizationMode prioritizationMode = PrioritizationMode.ALL_TASK_DROPS;
     private int minimumPriorityValue = 0;
     private DropDisplayMode dropDisplayMode = DropDisplayMode.DEPRIORITIZE;
     private boolean prioritizeExamine = true;
@@ -45,7 +44,6 @@ public class MenuPrioritizationTest {
 
         // Set up mock config behaviors
         when(config.enableDeprioritization()).thenAnswer(inv -> enableDeprioritization);
-        when(config.prioritizationMode()).thenAnswer(inv -> prioritizationMode);
         when(config.minimumPriorityValue()).thenAnswer(inv -> minimumPriorityValue);
         when(config.dropDisplayMode()).thenAnswer(inv -> dropDisplayMode);
         when(config.prioritizeExamine()).thenAnswer(inv -> prioritizeExamine);
@@ -60,11 +58,22 @@ public class MenuPrioritizationTest {
         when(config.alwaysPriorityItems()).thenReturn("");
         when(config.alwaysIgnoreItems()).thenReturn("");
         when(config.interestingDropsOnly()).thenReturn(false);
+        when(config.prioritizeUntradeables()).thenReturn(false);
+        when(config.showRarityInMenu()).thenReturn(false);
+        when(config.addManageMenuEntries()).thenReturn(false);
+        when(config.notifyMinTier()).thenReturn(NotifyTier.ALL_PRIORITY);
         when(config.enablePriorityMarker()).thenReturn(false);
-        when(config.priorityMarker()).thenReturn(PriorityMarker.NONE);
+        when(config.markerText()).thenReturn("*");
+        when(config.colorMarker()).thenReturn(false);
+        when(config.markerColor()).thenReturn(new java.awt.Color(0xFFFF00));
+        when(config.valueColor()).thenReturn(new java.awt.Color(0xAAAAAA));
+        when(config.rarityColor()).thenReturn(new java.awt.Color(0x9090FF));
         when(config.showItemValueInMenu()).thenReturn(false);
         when(config.itemValueDisplay()).thenReturn(ItemValueDisplay.GE);
         when(config.highlightTaskItems()).thenReturn(false);
+        when(config.highlightPart()).thenReturn(HighlightPart.NAME);
+        when(config.highlightExamine()).thenReturn(false);
+        when(config.useGroundItemsColors()).thenReturn(true);
         when(config.highlightColor()).thenReturn(new java.awt.Color(0x00FF00));
         when(config.highlightAboveValueOnly()).thenReturn(false);
         when(config.highlightByTier()).thenReturn(false);

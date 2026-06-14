@@ -87,6 +87,13 @@ public class PriorityItemClassifier {
         // Note: clue scroll handling is done in the plugin (it needs ordering control),
         // not here in the base priority classification.
 
+        // 3. Untradeable items (optional). Many valuable Slayer drops (imbue scrolls,
+        //    totem pieces, etc.) are untradeable and therefore have no GE value.
+        if (config.prioritizeUntradeables() && isUntradeable(itemId)) {
+            log.debug("[Classifier] Untradeable: {}", normalizedItemName);
+            return true;
+        }
+
         // 4. Minimum value threshold
         int minPrice = config.minimumPriorityValue();
         if (minPrice > 0) {
@@ -98,17 +105,10 @@ public class PriorityItemClassifier {
             }
         }
 
-        // 5. Task drop table check — skipped when interestingDropsOnly is enabled,
-        //    because task membership alone is not sufficient in that mode.
+        // 5. Task drop table membership. Skipped when "Interesting Drops Only" is on, since
+        //    in that mode being in the table is not enough — only value/rarity/lists qualify.
         if (!config.interestingDropsOnly() && taskDrops.contains(normalizedItemName)) {
-            if (config.prioritizationMode() == PrioritizationMode.ALL_TASK_DROPS) {
-                return true;
-            }
-            // VALUABLE_TASK_DROPS with minPrice == 0: can't filter by value, allow all
-            if (config.prioritizationMode() == PrioritizationMode.VALUABLE_TASK_DROPS && minPrice == 0) {
-                return true;
-            }
-            // VALUABLE_TASK_DROPS with minPrice > 0: already checked above, value was below threshold
+            return true;
         }
 
         // 6. Wiki rarity check. A drop is "rare enough" when its rate is 1/N or rarer,
@@ -185,6 +185,12 @@ public class PriorityItemClassifier {
             }
         }
         return 1;
+    }
+
+    private boolean isUntradeable(int itemId) {
+        ItemComposition comp = itemManager.getItemComposition(itemId);
+        int realId = comp.getNote() != -1 ? comp.getLinkedNoteId() : itemId;
+        return !itemManager.getItemComposition(realId).isTradeable();
     }
 
     private int getGePrice(int itemId) {
