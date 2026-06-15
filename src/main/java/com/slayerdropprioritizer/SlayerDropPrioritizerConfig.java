@@ -1,4 +1,4 @@
-package net.runelite.client.plugins.slayerdropprioritizer;
+package com.slayerdropprioritizer;
 
 import java.awt.Color;
 import net.runelite.client.config.Alpha;

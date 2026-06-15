@@ -1,4 +1,4 @@
-package net.runelite.client.plugins.slayerdropprioritizer;
+package com.slayerdropprioritizer;
 
 /**
  * Controls where clue scrolls are placed relative to other priority task drops.

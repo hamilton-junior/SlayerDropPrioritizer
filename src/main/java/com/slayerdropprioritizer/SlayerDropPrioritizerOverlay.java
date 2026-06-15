@@ -1,4 +1,4 @@
-package net.runelite.client.plugins.slayerdropprioritizer;
+package com.slayerdropprioritizer;
 
 import net.runelite.client.ui.overlay.OverlayPanel;
 import net.runelite.client.ui.overlay.OverlayPosition;

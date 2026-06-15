@@ -1,4 +1,4 @@
-package net.runelite.client.plugins.slayerdropprioritizer;
+package com.slayerdropprioritizer;
 
 public enum DropDisplayMode {
     SHOW,

@@ -1,4 +1,4 @@
-package net.runelite.client.plugins.slayerdropprioritizer;
+package com.slayerdropprioritizer;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;

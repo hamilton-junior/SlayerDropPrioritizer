@@ -1,4 +1,4 @@
-package net.runelite.client.plugins.slayerdropprioritizer;
+package com.slayerdropprioritizer;
 
 /**
  * Rarity classification of a task drop, derived from its OSRS Wiki drop rate and the

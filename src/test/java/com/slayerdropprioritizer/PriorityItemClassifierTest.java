@@ -1,4 +1,4 @@
-package net.runelite.client.plugins.slayerdropprioritizer;
+package com.slayerdropprioritizer;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;

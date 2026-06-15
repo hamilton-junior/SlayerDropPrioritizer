@@ -1,4 +1,4 @@
-package net.runelite.client.plugins.slayerdropprioritizer;
+package com.slayerdropprioritizer;
 
 /**
  * Which part of a ground item menu entry the highlight color is applied to.

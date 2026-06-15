@@ -1,4 +1,4 @@
-package net.runelite.client.plugins.slayerdropprioritizer;
+package com.slayerdropprioritizer;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;

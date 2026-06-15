@@ -14,9 +14,9 @@ repositories {
 }
 
 def runeLiteVersion = 'latest.release'
-def pluginMainClass = 'net.runelite.client.plugins.slayerdropprioritizer.SlayerDropPrioritizerPluginTest'
+def pluginMainClass = 'com.slayerdropprioritizer.SlayerDropPrioritizerPluginTest'
 
-group = 'net.runelite.client.plugins.slayerdropprioritizer'
+group = 'com.slayerdropprioritizer'
 version = '1.0.0'
 
 dependencies {
