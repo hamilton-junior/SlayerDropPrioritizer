@@ -17,7 +17,7 @@ def runeLiteVersion = 'latest.release'
 def pluginMainClass = 'com.slayerdropprioritizer.SlayerDropPrioritizerPluginTest'
 
 group = 'com.slayerdropprioritizer'
-version = '1.0.0'
+version = '1.0.1'
 
 dependencies {
 	compileOnly group: 'net.runelite', name:'client', version: runeLiteVersion
